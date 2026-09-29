@@ -471,7 +471,7 @@ func applyV1Txn(txn *Transaction, update []byte) (retErr error) {
 	// 1. Decode all items, parking any with future-clock deps or same-client gaps.
 	//    Returns the within-update pending list (items whose parent might resolve
 	//    later in this same update).
-	withinUpdatePending, err := decodeAndPark(txn, dec, sv, numClients)
+	withinUpdatePending, err := decodeAndPark(txn, dec, sv, numClients, update)
 	if err != nil {
 		return wrapUpdateErr(err)
 	}
@@ -499,15 +499,16 @@ func applyV1Txn(txn *Transaction, update []byte) (retErr error) {
 // item, and either:
 //
 //	(a) skips fully-integrated items
-//	(b) parks items with same-client clock gaps in store.pending
+//	(b) defers items with same-client clock gaps within this update
 //	(c) integrates GC items directly via store.Append
 //	(d) integrates items whose parent is known via item.integrate
 //	(e) collects items whose parent is unresolved-but-might-be-in-this-update
 //	    into the returned slice for the within-update retry pass.
 //
 // numClients is the count parsed from the header.
-func decodeAndPark(txn *Transaction, dec *encoding.Decoder, sv StateVector, numClients uint64) ([]*Item, error) {
+func decodeAndPark(txn *Transaction, dec *encoding.Decoder, sv StateVector, numClients uint64, update []byte) ([]*Item, error) {
 	var pending []*Item
+	budget := newPendingBudget(txn.doc, sv, update, false)
 
 	totalStructs := uint64(0)
 	for i := uint64(0); i < numClients; i++ {
@@ -571,6 +572,9 @@ func decodeAndPark(txn *Transaction, dec *encoding.Decoder, sv StateVector, numC
 			// the cross-update pending limit.
 			if clock > existingEnd {
 				pending = append(pending, item)
+				if err := budget.check(len(pending)); err != nil {
+					return nil, err
+				}
 				clock = itemEnd
 				continue
 			}
@@ -592,6 +596,9 @@ func decodeAndPark(txn *Transaction, dec *encoding.Decoder, sv StateVector, numC
 			// reference to a group not yet decoded) are deferred.
 			if item.Parent == nil {
 				pending = append(pending, item)
+				if err := budget.check(len(pending)); err != nil {
+					return nil, err
+				}
 				clock = itemEnd
 				continue
 			}
@@ -608,6 +615,9 @@ func decodeAndPark(txn *Transaction, dec *encoding.Decoder, sv StateVector, numC
 			if offset == 0 && item.OriginRight != nil &&
 				item.OriginRight.Clock >= txn.doc.store.NextClock(item.OriginRight.Client) {
 				pending = append(pending, item)
+				if err := budget.check(len(pending)); err != nil {
+					return nil, err
+				}
 				clock = itemEnd
 				continue
 			}

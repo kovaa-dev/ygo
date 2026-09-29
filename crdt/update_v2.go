@@ -608,6 +608,7 @@ func applyV2Txn(txn *Transaction, update []byte) (retErr error) {
 	}
 
 	var pending []*Item
+	budget := newPendingBudget(txn.doc, sv, update, true)
 
 	totalStructs := uint64(0)
 	for i := uint64(0); i < numClients; i++ {
@@ -721,6 +722,9 @@ func applyV2Txn(txn *Transaction, update []byte) (retErr error) {
 			// the cross-update pending limit.
 			if clock > existingEnd {
 				pending = append(pending, item)
+				if err := budget.check(len(pending)); err != nil {
+					return err
+				}
 				clock = itemEnd
 				continue
 			}
@@ -745,6 +749,9 @@ func applyV2Txn(txn *Transaction, update []byte) (retErr error) {
 			// reference to a group not yet decoded) are deferred.
 			if item.Parent == nil {
 				pending = append(pending, item)
+				if err := budget.check(len(pending)); err != nil {
+					return err
+				}
 				clock = itemEnd
 				continue
 			}
@@ -758,6 +765,9 @@ func applyV2Txn(txn *Transaction, update []byte) (retErr error) {
 			if offset == 0 && item.OriginRight != nil &&
 				item.OriginRight.Clock >= txn.doc.store.NextClock(item.OriginRight.Client) {
 				pending = append(pending, item)
+				if err := budget.check(len(pending)); err != nil {
+					return err
+				}
 				clock = itemEnd
 				continue
 			}
