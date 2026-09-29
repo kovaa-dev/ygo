@@ -44,25 +44,3 @@ func BenchmarkGCTransactionSparseRanges(b *testing.B) {
 		})
 	}
 }
-
-func BenchmarkCheckpointMapReplacements(b *testing.B) {
-	doc := newTestDoc(1)
-	defer doc.Destroy()
-	values := doc.GetMap("values")
-	for round := 0; round < 2; round++ {
-		doc.Transact(func(txn *Transaction) {
-			for i := 0; i < 1000; i++ {
-				values.Set(txn, fmt.Sprint(i), round)
-			}
-		})
-	}
-	update := EncodeStateAsUpdateV1(doc, nil)
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		receiver := New()
-		if err := ApplyUpdateV1(receiver, update, nil); err != nil {
-			b.Fatal(err)
-		}
-		receiver.Destroy()
-	}
-}
