@@ -13,24 +13,32 @@ import (
 // References merely being present in the message is insufficient: their own
 // dependencies must be reachable too (including same-client predecessors).
 type pendingBudget struct {
-	initial   StateVector
-	update    []byte
-	remaining int
-	v2        bool
-	checked   bool
+	processing *ProcessingBudget
+	initial    StateVector
+	update     []byte
+	remaining  int
+	v2         bool
+	checked    bool
 }
 
-func newPendingBudget(doc *Doc, initial StateVector, update []byte, v2 bool) pendingBudget {
+func newPendingBudget(doc *Doc, initial StateVector, update []byte, v2 bool, processing ...*ProcessingBudget) pendingBudget {
+	var resource *ProcessingBudget
+	if len(processing) > 0 {
+		resource = processing[0]
+	}
 	remaining := doc.maxPendingItemsLimit()
 	if doc.store.pending != nil {
 		remaining -= len(doc.store.pending.items)
 	}
-	return pendingBudget{initial: initial, update: update, remaining: remaining, v2: v2}
+	return pendingBudget{processing: resource, initial: initial, update: update, remaining: remaining, v2: v2}
 }
 
 func (b *pendingBudget) check(count int) error {
 	if b.checked || count < b.remaining {
 		return nil
+	}
+	if !b.processing.allocate(uint64(len(b.initial))*128 + 128) {
+		return b.processing.err
 	}
 	known := make(StateVector, len(b.initial))
 	for client, clock := range b.initial {
@@ -38,6 +46,9 @@ func (b *pendingBudget) check(count int) error {
 	}
 	for first := true; ; first = false {
 		s := newPendingScanner(b.update, b.v2)
+		if b.processing != nil && !b.v2 {
+			s.rest = encoding.NewDecoderWithBudget(b.update, b.processing.decoder())
+		}
 		clients := s.uint()
 		if clients > maxV2Items {
 			return ErrInvalidUpdate
@@ -56,6 +67,9 @@ func (b *pendingBudget) check(count int) error {
 				existingEnd = b.initial.Clock(client)
 			}
 			for j := uint64(0); j < n && s.err == nil; j++ {
+				if !b.processing.step(1) {
+					return b.processing.err
+				}
 				length, skip, deps, numDeps := s.item()
 				end := clock + length
 				if end < clock {

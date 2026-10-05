@@ -177,6 +177,11 @@ func extractMapValue(item *Item) any {
 // on any other container (#222). Overwriting or deleting a staged entry
 // releases its handle, making it stageable elsewhere.
 func (m *YMap) Set(txn *Transaction, key string, value any) {
+	if b := txn.localBudget(); b != nil {
+		b.mustAllocate(1024)
+		key = ownLocalValue(key, b).(string)
+		value = ownLocalValue(value, b)
+	}
 	checkUTF8("YMap.Set", "key", key)
 	checkAnyUTF8("YMap.Set", "value", value)
 

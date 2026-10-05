@@ -100,6 +100,8 @@ func (t *abstractType) findMarkerRO(index int) (*Item, int) {
 	best := -1
 	bestDist := 0
 	for i, m := range t.markers {
+		t.localWork()
+
 		if m.item == nil {
 			continue
 		}
@@ -184,6 +186,8 @@ func (t *abstractType) markPositionAt(index int) {
 	var marker *searchMarker
 	bestDist := 0
 	for i := range t.markers {
+		t.localWork()
+
 		if t.markers[i].item == nil {
 			continue
 		}
@@ -212,6 +216,8 @@ func (t *abstractType) markPositionAt(index int) {
 	// contribution (incl. ContentMove) comes from renderedStep so the marker's
 	// index tracks rendered — not physical — position, agreeing with findMarkerRO.
 	for p.Right != nil && pindex < index {
+		t.localWork()
+
 		if countable, n, _ := t.renderedStep(p); countable {
 			if index < pindex+n {
 				break
@@ -222,6 +228,8 @@ func (t *abstractType) markPositionAt(index int) {
 	}
 	// Iterate left if we overshot (marker started to the right of the target).
 	for p.Left != nil && pindex > index {
+		t.localWork()
+
 		p = p.Left
 		if countable, n, _ := t.renderedStep(p); countable {
 			pindex -= n
@@ -236,6 +244,8 @@ func (t *abstractType) markPositionAt(index int) {
 	for p.Left != nil &&
 		p.Left.ID.Client == p.ID.Client &&
 		p.Left.ID.Clock+uint64(p.Left.Content.Len()) == p.ID.Clock {
+		t.localWork()
+
 		p = p.Left
 		if countable, n, _ := t.renderedStep(p); countable {
 			pindex -= n
@@ -268,6 +278,8 @@ func (t *abstractType) markPosition(item *Item, index int) {
 	}
 	oldest := 0
 	for i := 1; i < len(t.markers); i++ {
+		t.localWork()
+
 		if t.markers[i].timestamp < t.markers[oldest].timestamp {
 			oldest = i
 		}
@@ -303,6 +315,8 @@ func (t *abstractType) markPosition(item *Item, index int) {
 // flags are already updated for this edit.
 func (t *abstractType) updateMarkerChanges(index, delta int) {
 	for i := len(t.markers) - 1; i >= 0; i-- {
+		t.localWork()
+
 		m := &t.markers[i]
 		if m.item == nil || m.item.Deleted {
 			t.markers = append(t.markers[:i], t.markers[i+1:]...)
@@ -341,6 +355,8 @@ func absInt(x int) int {
 // point instead of always starting at t.start. It never writes to t.markers.
 func (t *abstractType) walkColdFrom(from *Item, counted int, index int) (*Item, int) {
 	for item := from; item != nil; item = item.Right {
+		t.localWork()
+
 		countable, n, _ := t.renderedStep(item)
 		if !countable {
 			continue
@@ -371,10 +387,14 @@ func (t *abstractType) walkColdFrom(from *Item, counted int, index int) (*Item, 
 func (t *abstractType) walkLeftFrom(cur *Item, curS int, index int) (*Item, int) {
 	best, bestS := cur, curS
 	for bestS >= index {
+		t.localWork()
+
 		p := best.Left
 		var pItem *Item
 		var pLen int
 		for p != nil {
+			t.localWork()
+
 			countable, n, _ := t.renderedStep(p)
 			if countable {
 				pItem = p

@@ -68,6 +68,9 @@ func decodeStructsV1Bounded(scratch *Doc, dec *encoding.Decoder, maxStructs uint
 			if err := dec.ReserveValues(1); err != nil {
 				return nil, DeleteSet{}, err
 			}
+			if err := dec.ReserveAllocation(512); err != nil {
+				return nil, DeleteSet{}, err
+			}
 			item, err := decodeItem(dec, scratch, client, clock)
 			if err != nil {
 				return nil, DeleteSet{}, fmt.Errorf("%w: %w", ErrInvalidUpdate, err)

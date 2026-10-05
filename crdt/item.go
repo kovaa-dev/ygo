@@ -80,6 +80,9 @@ func strPtr(s string) *string { return &s }
 // in the store (a split scenario during update decoding). For Phase 2 all
 // items arrive cleanly (offset = 0).
 func (item *Item) integrate(txn *Transaction, offset int) {
+	if !txn.work(1) {
+		return
+	}
 	if offset > 0 {
 		item.ID.Clock += uint64(offset)
 		item.Left = txn.doc.store.getItemCleanEnd(txn, item.ID.Client, item.ID.Clock-1)
@@ -87,7 +90,13 @@ func (item *Item) integrate(txn *Transaction, offset int) {
 			last := item.Left.ID.Clock + uint64(item.Left.Content.Len()) - 1
 			item.Origin = &ID{Client: item.Left.ID.Client, Clock: last}
 		}
+		if txn.budget != nil && !prepareBudgetSplit(txn, item) {
+			return
+		}
 		item.Content = item.Content.Splice(offset)
+		if txn.budget != nil {
+			ownSplitContent(item.Content)
+		}
 	}
 
 	if item.Parent == nil {
@@ -134,9 +143,15 @@ func (item *Item) integrate(txn *Transaction, offset int) {
 
 		// Scan right until we hit our right origin (item.Right) or the end.
 		for o != nil && o != item.Right {
+			if !txn.work(1) {
+				return
+			}
 			if item.ParentSub != nil && !parentSubEqual(item.ParentSub, o.ParentSub) {
 				o = o.Right
 				continue
+			}
+			if !txn.allocate(128) {
+				return
 			}
 			beforeOrigin[o] = struct{}{}
 			conflicting[o] = struct{}{}
@@ -356,6 +371,9 @@ func (item *Item) integrate(txn *Transaction, offset int) {
 		// these common insertion and replacement cases.
 		if previous, exists := item.Parent.itemMap[key]; exists && previous != item.Left {
 			for r := item.Right; r != nil; r = r.Right {
+				if !txn.work(1) {
+					return
+				}
 				if parentSubEqual(r.ParentSub, item.ParentSub) {
 					// A same-key item (live or tombstone) sits to our right and is
 					// therefore the more-recent value — we are superseded.
@@ -401,6 +419,9 @@ func (item *Item) integrate(txn *Transaction, offset int) {
 // was deleted (Yjs JS Item.delete walks content.getContent() identically;
 // yrs Block::delete does the same). See #72 vector B1.
 func (item *Item) delete(txn *Transaction) {
+	if !txn.work(1) || !txn.allocate(128) {
+		return
+	}
 	if item.Deleted {
 		return
 	}
@@ -435,6 +456,9 @@ func (item *Item) delete(txn *Transaction) {
 	// delete-set too. Recursive call handles arbitrarily-deep nesting.
 	if ct, ok := item.Content.(*ContentType); ok && ct.Type != nil {
 		for child := ct.Type.start; child != nil; child = child.Right {
+			if !txn.work(1) {
+				return
+			}
 			if !child.Deleted {
 				child.delete(txn)
 			}
@@ -457,7 +481,17 @@ func (item *Item) delete(txn *Transaction) {
 // item.Content is mutated to hold [0, offset); the returned item holds [offset, end).
 // Both halves are registered in the store. The linked-list pointers are updated.
 func splitItem(txn *Transaction, item *Item, offset int) *Item {
+	if !txn.work(1) || !txn.allocate(512) {
+		return item
+	}
+	if txn.budget != nil && !prepareBudgetSplit(txn, item) {
+		return item
+	}
 	rightContent := item.Content.Splice(offset) // mutates item.Content → [0, offset)
+	if txn.budget != nil {
+		ownSplitContent(item.Content)
+		ownSplitContent(rightContent)
+	}
 	right := &Item{
 		ID:          ID{Client: item.ID.Client, Clock: item.ID.Clock + uint64(offset)},
 		Origin:      &ID{Client: item.ID.Client, Clock: item.ID.Clock + uint64(offset) - 1},

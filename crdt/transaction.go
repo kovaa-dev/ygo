@@ -10,6 +10,7 @@ import (
 // operation. Observers fire once per transaction, not once per operation,
 // which keeps event handler overhead proportional to transactions not edits.
 type Transaction struct {
+	budget      *ProcessingBudget
 	doc         *Doc
 	Origin      any  // user-supplied tag forwarded to update observers
 	Local       bool // true when the change originated on this peer
@@ -95,6 +96,10 @@ func (t *Transaction) assertLive(method string) {
 // GetText returns the named root YText, creating it if it does not exist.
 // Safe to call inside the Transact callback; see the section comment above.
 func (t *Transaction) GetText(name string) *YText {
+	if b := t.localBudget(); b != nil {
+		b.mustAllocate(1024)
+		name = ownLocalValue(name, b).(string)
+	}
 	checkUTF8("Transaction.GetText", "name", name)
 	t.assertLive("GetText")
 	return t.doc.getTextLocked(name)
@@ -103,6 +108,10 @@ func (t *Transaction) GetText(name string) *YText {
 // GetMap returns the named root YMap, creating it if it does not exist.
 // Safe to call inside the Transact callback; see the section comment above.
 func (t *Transaction) GetMap(name string) *YMap {
+	if b := t.localBudget(); b != nil {
+		b.mustAllocate(1024)
+		name = ownLocalValue(name, b).(string)
+	}
 	checkUTF8("Transaction.GetMap", "name", name)
 	t.assertLive("GetMap")
 	return t.doc.getMapLocked(name)
@@ -111,6 +120,10 @@ func (t *Transaction) GetMap(name string) *YMap {
 // GetArray returns the named root YArray, creating it if it does not exist.
 // Safe to call inside the Transact callback; see the section comment above.
 func (t *Transaction) GetArray(name string) *YArray {
+	if b := t.localBudget(); b != nil {
+		b.mustAllocate(1024)
+		name = ownLocalValue(name, b).(string)
+	}
 	checkUTF8("Transaction.GetArray", "name", name)
 	t.assertLive("GetArray")
 	return t.doc.getArrayLocked(name)
@@ -120,6 +133,10 @@ func (t *Transaction) GetArray(name string) *YArray {
 // not exist. Safe to call inside the Transact callback; see the section
 // comment above.
 func (t *Transaction) GetXmlFragment(name string) *YXmlFragment {
+	if b := t.localBudget(); b != nil {
+		b.mustAllocate(1024)
+		name = ownLocalValue(name, b).(string)
+	}
 	checkUTF8("Transaction.GetXmlFragment", "name", name)
 	t.assertLive("GetXmlFragment")
 	return t.doc.getXmlFragmentLocked(name)
@@ -146,9 +163,15 @@ func squashRuns(txn *Transaction) {
 		return
 	}
 
+	if !txn.allocate(uint64(len(txn.newItems))*64 + 256) {
+		return
+	}
 	// Group new ContentString items by client.
 	byClient := make(map[ClientID][]*Item, 4)
 	for _, item := range txn.newItems {
+		if !txn.work(1) {
+			return
+		}
 		if !item.Deleted {
 			byClient[item.ID.Client] = append(byClient[item.ID.Client], item)
 		}
@@ -163,8 +186,14 @@ func squashRuns(txn *Transaction) {
 	var removedByClient map[ClientID][]*Item
 
 	for client, items := range byClient {
+		if !txn.work(1) {
+			return
+		}
 		if len(items) < 2 {
 			continue
+		}
+		if !txn.work(uint64(len(items)) * nLog(uint64(len(items)))) {
+			return
 		}
 		sort.Slice(items, func(i, j int) bool {
 			return items[i].ID.Clock < items[j].ID.Clock
@@ -173,6 +202,9 @@ func squashRuns(txn *Transaction) {
 
 		i := 0
 		for i < len(items) {
+			if !txn.work(1) {
+				return
+			}
 			left := items[i]
 
 			// Skip ineligible run starts.
@@ -188,10 +220,16 @@ func squashRuns(txn *Transaction) {
 			// O(string length) and would make the loop O(n²)).
 			expectedClock := left.ID.Clock + uint64(left.Content.Len())
 			var sb strings.Builder
+			if !budgetBuilderWrite(txn, &sb, left.Content.(*ContentString).Str) {
+				return
+			}
 			sb.WriteString(left.Content.(*ContentString).Str)
 
 			j := i + 1
 			for j < len(items) {
+				if !txn.work(1) {
+					return
+				}
 				right := items[j]
 				if right.Deleted || right.ID.Clock < beforeClock {
 					break
@@ -213,6 +251,9 @@ func squashRuns(txn *Transaction) {
 				}
 
 				// Collect right's string into the builder.
+				if !budgetBuilderWrite(txn, &sb, right.Content.(*ContentString).Str) {
+					return
+				}
 				sb.WriteString(right.Content.(*ContentString).Str)
 
 				// Schedule for store removal (appended in clock order).
@@ -239,6 +280,9 @@ func squashRuns(txn *Transaction) {
 					left.Parent.clearMarkers()
 				}
 				// Compact items slice: skip over all absorbed entries.
+				if !txn.work(uint64(len(items) - j)) {
+					return
+				}
 				items = append(items[:i+1], items[j:]...)
 			}
 			i++
@@ -252,6 +296,9 @@ func squashRuns(txn *Transaction) {
 		storeItems := store.clients[client]
 		n, ri := 0, 0
 		for _, item := range storeItems {
+			if !txn.work(1) {
+				return
+			}
 			if ri < len(removed) && item == removed[ri] {
 				ri++ // skip this squashed item
 			} else {
@@ -261,6 +308,9 @@ func squashRuns(txn *Transaction) {
 		}
 		// Zero out the tail to release GC references.
 		for k := n; k < len(storeItems); k++ {
+			if !txn.work(1) {
+				return
+			}
 			storeItems[k] = nil
 		}
 		store.clients[client] = storeItems[:n]
@@ -322,6 +372,17 @@ func tryMergeWithLefts(txn *Transaction) {
 	}
 	store := txn.doc.store
 	for _, item := range txn.mergeStructs {
+		if !txn.work(uint64(len(store.clients[item.ID.Client])) + 1) {
+			return
+		}
+		if txn.budget != nil {
+			if !prepareBudgetSplit(txn, item) {
+				return
+			}
+			if item.Left != nil && !prepareBudgetSplit(txn, item.Left) {
+				return
+			}
+		}
 		tryMergeWithLeft(item, store)
 	}
 }
@@ -428,6 +489,21 @@ func tryMergeWithLeft(item *Item, store *StructStore) bool {
 			store.clients[item.ID.Client] = append(storeItems[:i], storeItems[i+1:]...)
 			break
 		}
+	}
+	return true
+}
+
+// Reserve the next builder backing before append grows it. Keep old growth
+// charges until the operation ends, even if Go can collect old buffers sooner.
+func budgetBuilderWrite(txn *Transaction, builder *strings.Builder, value string) bool {
+	if txn.budget == nil {
+		return true
+	}
+	if !txn.work(uint64(len(value))) {
+		return false
+	}
+	if len(value) > builder.Cap()-builder.Len() {
+		return txn.allocate(uint64(builder.Len()+len(value))*2 + 256)
 	}
 	return true
 }

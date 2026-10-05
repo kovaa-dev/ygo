@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/bits"
 	"sort"
 	"unicode/utf8"
 )
@@ -17,7 +18,9 @@ var ErrVarIntOutOfRange = errors.New("encoding: VarInt magnitude exceeds lib0 55
 // Encoder writes values into a growing byte buffer using the lib0 encoding format.
 // Encoder is not safe for concurrent use; each goroutine should use its own instance.
 type Encoder struct {
-	buf []byte
+	buf    []byte
+	budget *EncodeBudget
+	err    error
 }
 
 // NewEncoder returns a new Encoder with a small pre-allocated buffer.
@@ -32,10 +35,17 @@ func (e *Encoder) Bytes() []byte { return e.buf }
 func (e *Encoder) Reset() { e.buf = e.buf[:0] }
 
 // WriteRaw appends raw bytes to the encoder buffer without any length prefix.
-func (e *Encoder) WriteRaw(b []byte) { e.buf = append(e.buf, b...) }
+func (e *Encoder) WriteRaw(b []byte) {
+	if e.reserve(len(b)) {
+		e.buf = append(e.buf, b...)
+	}
+}
 
 // WriteUint8 writes a single byte.
 func (e *Encoder) WriteUint8(v uint8) {
+	if !e.reserve(1) {
+		return
+	}
 	e.buf = append(e.buf, v)
 }
 
@@ -43,6 +53,9 @@ func (e *Encoder) WriteUint8(v uint8) {
 // with the MSB as a continuation flag (1 = more bytes follow, 0 = last byte).
 // Integers up to 2^53 are supported to match JavaScript's safe integer range.
 func (e *Encoder) WriteVarUint(v uint64) {
+	if !e.reserve(max(1, (bits.Len64(v)+6)/7)) {
+		return
+	}
 	for v >= 0x80 {
 		e.buf = append(e.buf, byte(v)|0x80)
 		v >>= 7
@@ -68,6 +81,9 @@ func (e *Encoder) WriteVarIntE(v int64) error {
 	}
 	if mag > (1<<55)-1 {
 		return ErrVarIntOutOfRange
+	}
+	if !e.reserve(1 + max(0, (bits.Len64(mag)-6+6)/7)) {
+		return nil
 	}
 	if mag < 64 {
 		e.buf = append(e.buf, sign|byte(mag))
@@ -106,11 +122,16 @@ func (e *Encoder) WriteVarInt(v int64) {
 //
 // Successful encoding is byte-identical to the previous unvalidated behaviour.
 func (e *Encoder) WriteVarStringE(s string) error {
+	if !e.Work(uint64(len(s))) {
+		return nil
+	}
 	if !utf8.ValidString(s) {
 		return ErrInvalidUTF8
 	}
 	e.WriteVarUint(uint64(len(s)))
-	e.buf = append(e.buf, s...)
+	if e.reserve(len(s)) {
+		e.buf = append(e.buf, s...)
+	}
 	return nil
 }
 
@@ -132,7 +153,9 @@ func (e *Encoder) WriteVarString(s string) {
 // WriteVarBytes encodes b as VarUint(len) followed by raw bytes.
 func (e *Encoder) WriteVarBytes(b []byte) {
 	e.WriteVarUint(uint64(len(b)))
-	e.buf = append(e.buf, b...)
+	if e.reserve(len(b)) {
+		e.buf = append(e.buf, b...)
+	}
 }
 
 // BigInt represents lib0 writeAny tag 122, encoded as a signed 64-bit integer.
@@ -140,6 +163,9 @@ type BigInt int64
 
 // WriteFloat32 writes a 32-bit IEEE 754 float in big-endian byte order.
 func (e *Encoder) WriteFloat32(v float32) {
+	if !e.reserve(4) {
+		return
+	}
 	var b [4]byte
 	binary.BigEndian.PutUint32(b[:], math.Float32bits(v))
 	e.buf = append(e.buf, b[:]...)
@@ -147,6 +173,9 @@ func (e *Encoder) WriteFloat32(v float32) {
 
 // WriteFloat64 writes a 64-bit IEEE 754 float in big-endian byte order.
 func (e *Encoder) WriteFloat64(v float64) {
+	if !e.reserve(8) {
+		return
+	}
 	var b [8]byte
 	binary.BigEndian.PutUint64(b[:], math.Float64bits(v))
 	e.buf = append(e.buf, b[:]...)
@@ -154,6 +183,9 @@ func (e *Encoder) WriteFloat64(v float64) {
 
 // WriteBigInt64 writes a signed 64-bit integer in big-endian byte order.
 func (e *Encoder) WriteBigInt64(v int64) {
+	if !e.reserve(8) {
+		return
+	}
 	var b [8]byte
 	binary.BigEndian.PutUint64(b[:], uint64(v))
 	e.buf = append(e.buf, b[:]...)
@@ -162,6 +194,9 @@ func (e *Encoder) WriteBigInt64(v int64) {
 // writeNegVarUint writes -(v) using sign-magnitude VarInt format.
 // Unlike WriteVarInt(-int64(v)), this correctly encodes -0 (as 0x40) when v=0.
 func (e *Encoder) writeNegVarUint(v uint64) {
+	if !e.reserve(1 + max(0, (bits.Len64(v)-6+6)/7)) {
+		return
+	}
 	const sign = byte(0x40)
 	if v < 64 {
 		e.buf = append(e.buf, sign|byte(v))
@@ -190,6 +225,9 @@ func (e *Encoder) writeNegVarUint(v uint64) {
 //	[]any          -> 117 + VarUint(len) + elements
 //	map[string]any -> 118 + VarUint(len) + key-value pairs
 func (e *Encoder) WriteAny(v any) {
+	if !e.Work(1) {
+		return
+	}
 	switch val := v.(type) {
 	case nil:
 		e.WriteUint8(126)
@@ -245,18 +283,27 @@ func (e *Encoder) WriteAny(v any) {
 		e.WriteUint8(117)
 		e.WriteVarUint(uint64(len(val)))
 		for _, item := range val {
+			if e.err != nil {
+				return
+			}
 			e.WriteAny(item)
 		}
 	case map[string]any:
 		e.WriteUint8(118)
 		e.WriteVarUint(uint64(len(val)))
 		// Sort keys for deterministic encoding; Go map iteration is random (N-M3).
+		if !e.Work(uint64(len(val))*uint64(max(1, bits.Len(uint(len(val)))))) || !e.reserveTemporary(uint64(len(val))*16) {
+			return
+		}
 		keys := make([]string, 0, len(val))
 		for k := range val {
 			keys = append(keys, k)
 		}
 		sort.Strings(keys)
 		for _, k := range keys {
+			if e.err != nil {
+				return
+			}
 			e.WriteVarString(k)
 			e.WriteAny(val[k])
 		}

@@ -241,11 +241,17 @@ func encodeFromSnapshotLocked(doc *Doc, snap *Snapshot) []byte {
 // whole-document RunGC entry point.
 func gcTxnDeleteSet(doc *Doc, txn *Transaction) {
 	for client, ranges := range txn.deleteSet.clients {
+		if !txn.work(1) {
+			return
+		}
 		items := doc.store.clients[client]
 		if len(items) == 0 {
 			continue
 		}
 		for _, r := range ranges {
+			if !txn.work(1) {
+				return
+			}
 			rangeEnd := r.Clock + r.Len
 			// Start at the item containing the range boundary. Searching by
 			// start clock avoids rescanning a growing prefix for every deletion.
@@ -254,6 +260,9 @@ func gcTxnDeleteSet(doc *Doc, txn *Transaction) {
 				start = 0
 			}
 			for _, item := range items[start:] {
+				if !txn.work(1) {
+					return
+				}
 				if item.ID.Clock >= rangeEnd {
 					break
 				}

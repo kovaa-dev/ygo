@@ -269,7 +269,13 @@ func rejectSharedVals(vals []any) {
 
 // Insert inserts vals at logical position index (0 = prepend, Len() = append).
 func (a *YArray) Insert(txn *Transaction, index int, vals []any) {
+	if b := txn.localBudget(); b != nil {
+		b.mustAllocate(1024)
+		vals = ownLocalValue(vals, b).([]any)
+	}
 	for i, v := range vals {
+		a.localWork()
+
 		checkAnyUTF8("YArray.Insert", fmt.Sprintf("value[%d]", i), v)
 	}
 	rejectSharedVals(vals)
@@ -347,7 +353,13 @@ func (a *YArray) insertContentAfterItem(txn *Transaction, left *Item, content Co
 // a Yjs peer would order the two results differently — a convergence divergence
 // surfaced by the #70 cross-impl fuzz oracle.
 func (a *YArray) Push(txn *Transaction, vals []any) {
+	if b := txn.localBudget(); b != nil {
+		b.mustAllocate(1024)
+		vals = ownLocalValue(vals, b).([]any)
+	}
 	for i, v := range vals {
+		a.localWork()
+
 		checkAnyUTF8("YArray.Push", fmt.Sprintf("value[%d]", i), v)
 	}
 	rejectSharedVals(vals)
@@ -364,6 +376,8 @@ func (a *YArray) Push(txn *Transaction, vals []any) {
 		last = t.start // all items deleted (leading tombstone), or nil if empty
 	}
 	for last != nil && last.Right != nil {
+		a.localWork()
+
 		last = last.Right
 	}
 	a.insertAfterItem(txn, last, vals, t.length)
@@ -768,6 +782,8 @@ func (a *YArray) Move(txn *Transaction, fromIndex, toIndex int) {
 	var targetItem *Item
 	var targetOff int
 	for item := t.start; item != nil; item = item.Right {
+		a.localWork()
+
 		countable, n, renderAt := t.renderedStep(item)
 		if !countable {
 			continue
@@ -893,6 +909,8 @@ func deleteRange(t *abstractType, txn *Transaction, index, length int) {
 		item, counted = t.findMarkerMut(index)
 	}
 	for item != nil && length > 0 {
+		t.localWork()
+
 		// Rendered contribution via the single shared, move-aware definition —
 		// the SAME one Get/Slice/ForEach use to resolve values — so deleteRange's
 		// counting can never drift out of step with what Get reports at a rendered

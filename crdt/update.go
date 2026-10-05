@@ -343,11 +343,22 @@ func encodeContent(enc *encoding.Encoder, c Content, offset int) {
 		vals := ct.Vals[offset:]
 		enc.WriteVarUint(uint64(len(vals)))
 		for _, v := range vals {
+			if enc.Err() != nil {
+				return
+			}
 			enc.WriteAny(v)
 		}
 	case *ContentBinary:
 		enc.WriteVarBytes(ct.Data)
 	case *ContentString:
+		if enc.Budgeted() {
+			if !enc.Work(uint64(len(ct.Str))) {
+				return
+			}
+			if offset > 0 && !enc.ReserveAllocation(uint64(len(ct.Str))*2+6) {
+				return
+			}
+		}
 		// Emit only the tail from `offset`. splitUTF16 emits a leading U+FFFD
 		// when offset bisects a surrogate pair, matching Yjs's mid-surrogate slice.
 		_, tail := splitUTF16(ct.Str, offset)
@@ -357,9 +368,21 @@ func encodeContent(enc *encoding.Encoder, c Content, offset int) {
 		// (V2 uses writeAny — see encodeContentV2.) Using WriteAny here put a
 		// lib0-tagged value on the wire that genuine Yjs decodes as a JSON
 		// string → failure. (#wire-conformance)
+		if enc.Budgeted() {
+			if err := admitSemanticValue(ct.Val, enc); err != nil {
+				enc.Fail(err)
+				return
+			}
+		}
 		enc.WriteVarString(fmtValToJSON(ct.Val))
 	case *ContentFormat:
 		enc.WriteVarString(ct.Key)
+		if enc.Budgeted() {
+			if err := admitSemanticValue(ct.Val, enc); err != nil {
+				enc.Fail(err)
+				return
+			}
+		}
 		enc.WriteVarString(fmtValToJSON(ct.Val))
 	case *ContentType:
 		tc, nodeName := typeClassOf(ct)
@@ -371,6 +394,9 @@ func encodeContent(enc *encoding.Encoder, c Content, offset int) {
 		vals := ct.Vals[offset:]
 		enc.WriteVarUint(uint64(len(vals)))
 		for _, v := range vals {
+			if enc.Err() != nil {
+				return
+			}
 			enc.WriteAny(v)
 		}
 	case *ContentDoc:
@@ -456,6 +482,9 @@ func applyV1Txn(txn *Transaction, update []byte) (retErr error) {
 	}()
 
 	dec := encoding.NewDecoder(update)
+	if txn.budget != nil {
+		dec = encoding.NewDecoderWithBudget(update, txn.budget.decoder())
+	}
 
 	// Snapshot state vector before applying anything (used for skip/offset logic).
 	sv := txn.doc.store.StateVector()
@@ -487,11 +516,15 @@ func applyV1Txn(txn *Transaction, update []byte) (retErr error) {
 	}
 	unresolvableDs := ds.applyToPartial(txn)
 	if len(unresolvableDs.clients) > 0 {
-		txn.doc.store.pendingDs.Merge(unresolvableDs)
+		if !txn.mergePendingDeletes(unresolvableDs) {
+			return txn.budget.err
+		}
 	}
 
 	drainPending(txn)
-
+	if txn.budget != nil {
+		return txn.budget.err
+	}
 	return nil
 }
 
@@ -508,13 +541,16 @@ func applyV1Txn(txn *Transaction, update []byte) (retErr error) {
 // numClients is the count parsed from the header.
 func decodeAndPark(txn *Transaction, dec *encoding.Decoder, sv StateVector, numClients uint64, update []byte) ([]*Item, error) {
 	var pending []*Item
-	budget := newPendingBudget(txn.doc, sv, update, false)
+	budget := newPendingBudget(txn.doc, sv, update, false, txn.budget)
 
 	totalStructs := uint64(0)
 	for i := uint64(0); i < numClients; i++ {
 		numStructs, err := dec.ReadVarUint()
 		if err != nil {
 			return nil, err
+		}
+		if numStructs > ^uint64(0)-totalStructs {
+			return nil, ErrInvalidUpdate
 		}
 		totalStructs += numStructs
 		if totalStructs > maxV2Items {
@@ -533,6 +569,9 @@ func decodeAndPark(txn *Transaction, dec *encoding.Decoder, sv StateVector, numC
 		existingEnd := sv.Clock(client)
 
 		for j := uint64(0); j < numStructs; j++ {
+			if !txn.work(1) || !txn.allocate(512) {
+				return nil, txn.budget.err
+			}
 			item, err := decodeItem(dec, txn.doc, client, clock)
 			if err != nil {
 				return nil, err
@@ -649,12 +688,18 @@ func resolveWithinUpdatePending(txn *Transaction, pending []*Item) error {
 	for len(pending) > 0 {
 		remaining := pending[:0]
 		for _, item := range pending {
+			if !txn.work(1) {
+				return txn.budget.err
+			}
 			if !tryIntegrate(txn, item) {
 				remaining = append(remaining, item)
 			}
 		}
 		if len(remaining) == len(pending) {
 			for _, item := range remaining {
+				if !txn.work(1) {
+					return txn.budget.err
+				}
 				if txn.doc.store.pending != nil && len(txn.doc.store.pending.items) >= txn.doc.maxPendingItemsLimit() {
 					return wrapUpdateErr(ErrInvalidUpdate)
 				}
@@ -683,6 +728,9 @@ func resolveWithinUpdatePending(txn *Transaction, pending []*Item) error {
 // outer applyV1Txn recover (v1.1.1) can convert the panic to an error.
 // Also retries pendingDs after each successful integration pass.
 func drainPending(txn *Transaction) {
+	if !txn.work(1) {
+		return
+	}
 	// pendingDs may be drainable even if pending items aren't — integrated
 	// items from this update might be targets of previously-parked deletes.
 	if len(txn.doc.store.pendingDs.clients) > 0 {
@@ -727,6 +775,9 @@ func drainPending(txn *Transaction) {
 				}
 			}()
 			for idx = 0; idx < len(items); idx++ {
+				if !txn.work(1) {
+					return
+				}
 				item := items[idx]
 				if tryIntegrate(txn, item) {
 					progressed = true

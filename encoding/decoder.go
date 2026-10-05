@@ -176,6 +176,9 @@ func (d *Decoder) ReadVarBytes() ([]byte, error) {
 	}
 	end := d.pos + int(n)
 	out := d.buf[d.pos:end]
+	if d.budget != nil && d.budget.CopyPayload {
+		out = append([]byte(nil), out...)
+	}
 	d.pos = end
 	return out, nil
 }

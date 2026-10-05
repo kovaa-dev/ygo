@@ -77,6 +77,8 @@ func (txt *YText) flushPrelim(txn *Transaction) {
 	ops := txt.pending
 	txt.pending = nil
 	for _, op := range ops {
+		txt.localWork()
+
 		op(txn)
 	}
 }
@@ -316,6 +318,11 @@ func (txt *YText) Len() int { return txt.length }
 // Keys whose requested value already matches the current state produce no
 // markers (empty diff = no work).
 func (txt *YText) Insert(txn *Transaction, index int, text string, attrs Attributes) {
+	if b := txn.localBudget(); b != nil {
+		b.mustAllocate(2048 + uint64(len(attrs))*2048)
+		text = ownLocalValue(text, b).(string)
+		attrs = ownLocalAttrs(attrs, b)
+	}
 	checkUTF8("YText.Insert", "text", text)
 	checkAttrsUTF8("YText.Insert", attrs)
 	if text == "" {
@@ -358,10 +365,14 @@ func (txt *YText) Insert(txn *Transaction, index int, text string, attrs Attribu
 		// linked-list order is observable, so sort keys.
 		keys := make([]string, 0, len(attrs))
 		for k := range attrs {
+			txt.localWork()
+
 			keys = append(keys, k)
 		}
 		sort.Strings(keys)
 		for _, k := range keys {
+			txt.localWork()
+
 			newVal := attrs[k]
 			oldVal, hadKey := currentAttrs[k]
 			// Treat (absent in current) and (newVal == nil) as the same state
@@ -397,6 +408,8 @@ func (txt *YText) Insert(txn *Transaction, index int, text string, attrs Attribu
 
 	// Opening markers — one per key whose value needs to change.
 	for _, d := range diff {
+		txt.localWork()
+
 		fmtItem := &Item{
 			ID:          ID{Client: txn.doc.clientID, Clock: clock},
 			Origin:      origin,
@@ -453,6 +466,8 @@ func (txt *YText) Insert(txn *Transaction, index int, text string, attrs Attribu
 		clock = txn.doc.store.NextClock(txn.doc.clientID)
 
 		for _, d := range diff {
+			txt.localWork()
+
 			var revertVal any
 			if d.hadKey {
 				revertVal = d.oldVal
@@ -501,6 +516,9 @@ func (txt *YText) Insert(txn *Transaction, index int, text string, attrs Attribu
 // safely shortcut this in general). Gated on t.disableMarkers too
 // so the force-cold test seam still exercises the full walk.
 func (txt *YText) currentAttributesAt(anchor *Item) Attributes {
+	if txt.doc != nil && txt.doc.processingBudget != nil {
+		txt.doc.processingBudget.mustAllocate(256)
+	}
 	t := &txt.abstractType
 	if !t.disableMarkers && !t.hasFormatting {
 		return make(Attributes)
@@ -510,11 +528,16 @@ func (txt *YText) currentAttributesAt(anchor *Item) Attributes {
 		return attrs
 	}
 	for item := txt.start; item != nil; item = item.Right {
+		txt.localWork()
+
 		if !item.Deleted {
 			if cf, ok := item.Content.(*ContentFormat); ok {
 				if cf.Val == nil {
 					delete(attrs, cf.Key)
 				} else {
+					if txt.doc != nil && txt.doc.processingBudget != nil {
+						txt.doc.processingBudget.mustAllocate(256)
+					}
 					attrs[cf.Key] = cf.Val
 				}
 			}
@@ -539,6 +562,11 @@ func (txt *YText) currentAttributesAt(anchor *Item) Attributes {
 //
 // Added in v1.12.0 (#76).
 func (txt *YText) InsertEmbed(txn *Transaction, index int, embed any, attrs Attributes) {
+	if b := txn.localBudget(); b != nil {
+		b.mustAllocate(2048 + uint64(len(attrs))*2048)
+		embed = ownLocalValue(embed, b)
+		attrs = ownLocalAttrs(attrs, b)
+	}
 	checkAnyUTF8("YText.InsertEmbed", "embed", embed)
 	checkAttrsUTF8("YText.InsertEmbed", attrs)
 	if txt.detached() {
@@ -573,6 +601,8 @@ func (txt *YText) InsertEmbed(txn *Transaction, index int, embed any, attrs Attr
 	// Opening attr markers — same pattern as Insert with attrs.
 	if len(attrs) > 0 {
 		for k, v := range attrs {
+			txt.localWork()
+
 			fmtItem := &Item{
 				ID:          ID{Client: txn.doc.clientID, Clock: clock},
 				Origin:      origin,
@@ -619,6 +649,8 @@ func (txt *YText) InsertEmbed(txn *Transaction, index int, embed any, attrs Attr
 		clock = txn.doc.store.NextClock(txn.doc.clientID)
 
 		for k := range attrs {
+			txt.localWork()
+
 			closeItem := &Item{
 				ID:          ID{Client: txn.doc.clientID, Clock: clock},
 				Origin:      origin,
@@ -704,6 +736,8 @@ func (txt *YText) cleanupDanglingFormatsInRegion(txn *Transaction, startAnchor *
 	}
 	seenLivePast := false
 	for node != nil {
+		txt.localWork()
+
 		next := node.Right
 		if node.Deleted {
 			node = next
@@ -715,6 +749,8 @@ func (txt *YText) cleanupDanglingFormatsInRegion(txn *Transaction, startAnchor *
 				// marker doesn't count as a live opener.
 				hasLiveOpener := false
 				for p := node.Left; p != nil; p = p.Left {
+					txt.localWork()
+
 					if p.Deleted {
 						continue
 					}
@@ -738,6 +774,8 @@ func (txt *YText) cleanupDanglingFormatsInRegion(txn *Transaction, startAnchor *
 				// scope (until the next same-key marker).
 				hasLiveInScope := false
 				for n := node.Right; n != nil; n = n.Right {
+					txt.localWork()
+
 					if n.Deleted {
 						continue
 					}
@@ -787,6 +825,10 @@ func (txt *YText) cleanupDanglingFormatsInRegion(txn *Transaction, startAnchor *
 // removal marker before the source marker when both share the same origin.
 // Full concurrent attribute removal is tracked as a follow-up improvement.
 func (txt *YText) Format(txn *Transaction, index, length int, attrs Attributes) {
+	if b := txn.localBudget(); b != nil {
+		b.mustAllocate(2048 + uint64(len(attrs))*2048)
+		attrs = ownLocalAttrs(attrs, b)
+	}
 	checkAttrsUTF8("YText.Format", attrs)
 	if len(attrs) == 0 || length <= 0 {
 		return
@@ -830,6 +872,8 @@ func (t *abstractType) applyFormatAtPos(txn *Transaction, pos *itemTextPos, leng
 	// linked-list order is observable, so sort keys.
 	keys := make([]string, 0, len(attrs))
 	for k := range attrs {
+		t.localWork()
+
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
@@ -840,6 +884,8 @@ func (t *abstractType) applyFormatAtPos(txn *Transaction, pos *itemTextPos, leng
 	remaining := length
 	for pos.right != nil &&
 		(remaining > 0 || (len(negated) > 0 && (pos.right.Deleted || isContentFormat(pos.right)))) {
+		t.localWork()
+
 		if !pos.right.Deleted {
 			if cf, ok := pos.right.Content.(*ContentFormat); ok {
 				if _, touched := attrs[cf.Key]; touched {
@@ -901,6 +947,13 @@ type itemTextPos struct {
 // forward advances the cursor one item rightward, updating cur when passing a
 // live ContentFormat and index when passing live countable content.
 func (p *itemTextPos) forward() {
+	if p.right != nil && p.right.Parent != nil {
+		t := p.right.Parent
+		t.localWork()
+		if t.doc != nil && t.doc.processingBudget != nil {
+			t.doc.processingBudget.mustAllocate(256)
+		}
+	}
 	if p.right == nil {
 		return
 	}
@@ -926,6 +979,10 @@ func (p *itemTextPos) forward() {
 func (p *itemTextPos) advance(txn *Transaction, n int) {
 	count := n
 	for p.right != nil && count > 0 {
+		if txn.budget != nil {
+			txn.budget.mustWork(1)
+		}
+
 		if cf, ok := p.right.Content.(*ContentFormat); ok {
 			if !p.right.Deleted {
 				updateAttr(p.cur, cf)
@@ -975,6 +1032,8 @@ func (t *abstractType) skipDeletedForTextAnchor(left *Item) *Item {
 		next = left.Right
 	}
 	for next != nil && next.Deleted {
+		t.localWork()
+
 		left = next
 		next = next.Right
 	}
@@ -1026,6 +1085,9 @@ func (t *abstractType) findTextPos(txn *Transaction, index int) *itemTextPos {
 // advances the cursor past it. Mirrors the marker insertion in Yjs
 // insertAttributes / insertNegatedAttributes.
 func (t *abstractType) insertFormatAt(txn *Transaction, pos *itemTextPos, key string, val any) {
+	if b := txn.localBudget(); b != nil {
+		b.mustAllocate(1024)
+	}
 	origin, originRight := itemOrigins(pos.left, t)
 	it := &Item{
 		ID:          ID{Client: txn.doc.clientID, Clock: txn.doc.store.NextClock(txn.doc.clientID)},
@@ -1063,6 +1125,8 @@ func minimizeAttributeChanges(pos *itemTextPos, attrs Attributes) {
 func (t *abstractType) insertAttributes(txn *Transaction, pos *itemTextPos, keys []string, attrs Attributes) Attributes {
 	negated := make(Attributes)
 	for _, key := range keys {
+		t.localWork()
+
 		val := attrs[key]
 		curVal := pos.cur[key] // nil when absent
 		if !attrEqual(curVal, val) {
@@ -1079,6 +1143,8 @@ func (t *abstractType) insertAttributes(txn *Transaction, pos *itemTextPos, keys
 // key. Mirrors Yjs insertNegatedAttributes.
 func (t *abstractType) insertNegatedAttributes(txn *Transaction, pos *itemTextPos, negated Attributes, keys []string) {
 	for pos.right != nil {
+		t.localWork()
+
 		if pos.right.Deleted {
 			pos.forward()
 			continue
@@ -1093,6 +1159,8 @@ func (t *abstractType) insertNegatedAttributes(txn *Transaction, pos *itemTextPo
 		break
 	}
 	for _, key := range keys {
+		t.localWork()
+
 		if v, has := negated[key]; has {
 			t.insertFormatAt(txn, pos, key, v)
 		}
@@ -1169,6 +1237,11 @@ func (txt *YText) ToDelta() []Delta {
 		doc.mu.RLock()
 		defer doc.mu.RUnlock()
 	}
+	return txt.toDeltaLocked()
+}
+
+// Caller holds the document read lock.
+func (txt *YText) toDeltaLocked() []Delta {
 	var deltas []Delta
 	currentAttrs := make(Attributes)
 
@@ -1366,10 +1439,14 @@ func (t *abstractType) applyDeltaInsert(txn *Transaction, pos *itemTextPos, text
 	if len(attrs) > 0 {
 		keys := make([]string, 0, len(attrs))
 		for k := range attrs {
+			t.localWork()
+
 			keys = append(keys, k)
 		}
 		sort.Strings(keys)
 		for _, k := range keys {
+			t.localWork()
+
 			newVal := attrs[k]
 			oldVal, hadKey := pos.cur[k]
 			if !hadKey && newVal == nil {
@@ -1399,6 +1476,8 @@ func (t *abstractType) applyDeltaInsert(txn *Transaction, pos *itemTextPos, text
 	clock := txn.doc.store.NextClock(txn.doc.clientID)
 
 	for _, d := range diff {
+		t.localWork()
+
 		fmtItem := &Item{
 			ID:          ID{Client: txn.doc.clientID, Clock: clock},
 			Origin:      origin,
@@ -1450,6 +1529,8 @@ func (t *abstractType) applyDeltaInsert(txn *Transaction, pos *itemTextPos, text
 		clock = txn.doc.store.NextClock(txn.doc.clientID)
 
 		for _, d := range diff {
+			t.localWork()
+
 			var revertVal any
 			if d.hadKey {
 				revertVal = d.oldVal
@@ -1491,6 +1572,8 @@ func (t *abstractType) applyDeltaDelete(txn *Transaction, pos *itemTextPos, leng
 	}
 	origLen := length
 	for pos.right != nil && length > 0 {
+		t.localWork()
+
 		item := pos.right
 		if !item.Deleted {
 			if cf, ok := item.Content.(*ContentFormat); ok {

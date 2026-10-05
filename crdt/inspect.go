@@ -15,6 +15,8 @@ type UpdateInspectionOptions struct {
 	MaxStructs      uint64
 	MaxValues       uint64
 	MaxPayloadBytes uint64
+	// Reserve runs before charged decoding and inspection scratch allocations.
+	Reserve func(uint64) error
 }
 
 // InspectedParent describes a nested shared container, from inner to outer.
@@ -69,8 +71,11 @@ func InspectUpdateV1(doc *Doc, update []byte, options UpdateInspectionOptions, v
 	if err := ctx.Err(); err != nil {
 		return UpdateInspectionResult{}, err
 	}
-	budget := &encoding.DecodeBudget{Context: ctx, MaxValues: options.MaxValues, MaxPayloadBytes: options.MaxPayloadBytes}
+	budget := &encoding.DecodeBudget{Context: ctx, MaxValues: options.MaxValues, MaxPayloadBytes: options.MaxPayloadBytes, Reserve: options.Reserve}
 	dec := encoding.NewDecoderWithBudget(update, budget)
+	if err := dec.ReserveAllocation(16384); err != nil {
+		return UpdateInspectionResult{}, err
+	}
 	scratch := New(WithClientID(0))
 	defer scratch.Destroy()
 	incoming, _, err := decodeStructsV1Bounded(scratch, dec, options.MaxStructs)
@@ -98,6 +103,9 @@ func InspectUpdateV1(doc *Doc, update []byte, options UpdateInspectionOptions, v
 		}
 	}
 	if doc.store.pending != nil {
+		if err := dec.ReserveAllocation(uint64(len(doc.store.pending.items)) * 128); err != nil {
+			return UpdateInspectionResult{}, err
+		}
 		if err := dec.ReserveValues(uint64(len(doc.store.pending.items))); err != nil {
 			return UpdateInspectionResult{}, err
 		}

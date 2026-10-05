@@ -13,11 +13,14 @@ var ErrDecodeBudgetExceeded = errors.New("encoding: decode budget exceeded")
 // Zero limits are unlimited; legacy decoder limits still apply. A budget is
 // mutable, single-use, and must not be shared between concurrent decoders.
 type DecodeBudget struct {
+	Work            func(uint64) error
 	Context         context.Context
 	MaxValues       uint64
 	MaxPayloadBytes uint64
 	values          uint64
 	payload         uint64
+	Reserve         func(uint64) error
+	CopyPayload     bool
 }
 
 func (b *DecodeBudget) check() error {
@@ -51,7 +54,21 @@ func (d *Decoder) ReserveValues(n uint64) error {
 	if d.budget == nil {
 		return nil
 	}
-	return d.budget.reserve(&d.budget.values, n, d.budget.MaxValues)
+	if d.budget.Work != nil {
+		if err := d.budget.Work(n); err != nil {
+			return err
+		}
+	}
+	if err := d.budget.reserve(&d.budget.values, n, d.budget.MaxValues); err != nil {
+		return err
+	}
+	if d.budget.Reserve != nil {
+		if n > ^uint64(0)/128 {
+			return ErrDecodeBudgetExceeded
+		}
+		return d.budget.Reserve(n * 128)
+	}
+	return nil
 }
 
 // ReservePayload reserves payload bytes before a caller materializes data that
@@ -60,5 +77,34 @@ func (d *Decoder) ReservePayload(n uint64) error {
 	if d.budget == nil {
 		return nil
 	}
-	return d.budget.reserve(&d.budget.payload, n, d.budget.MaxPayloadBytes)
+	if d.budget.Work != nil {
+		if err := d.budget.Work(n); err != nil {
+			return err
+		}
+	}
+	if err := d.budget.reserve(&d.budget.payload, n, d.budget.MaxPayloadBytes); err != nil {
+		return err
+	}
+	if d.budget.Reserve != nil {
+		if n > ^uint64(0)/2 {
+			return ErrDecodeBudgetExceeded
+		}
+		return d.budget.Reserve(n * 2)
+	}
+	return nil
+}
+
+// ReserveAllocation admits content-specific fixed/container allocations without
+// consuming decoded value or payload counters. Legacy decoders ignore it.
+func (d *Decoder) ReserveAllocation(n uint64) error {
+	if d.budget == nil {
+		return nil
+	}
+	if err := d.budget.check(); err != nil {
+		return err
+	}
+	if d.budget.Reserve != nil {
+		return d.budget.Reserve(n)
+	}
+	return nil
 }

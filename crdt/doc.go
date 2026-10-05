@@ -142,16 +142,17 @@ type subdocsSub struct {
 // Doc is the root of a Yjs collaborative document.
 // All shared types (YArray, YMap, YText, …) live inside a Doc.
 type Doc struct {
-	clientID        ClientID
-	gc              bool
-	guid            string // guid identifies this document (for subdocument embedding). Defaults to a random uuidv4 (see New) unless set with WithGUID.
-	shouldLoad      bool
-	autoLoad        bool
-	collectionID    string
-	item            *Item // set on integrate when this Doc is embedded as a subdocument (#63)
-	subdocs         map[string]*Doc
-	onSubdocs       []subdocsSub
-	maxPendingItems int // 0 = use defaultMaxPendingItems; see WithMaxPendingItems and #46
+	processingBudget *ProcessingBudget // Only set while budgeted mutation holds mu.
+	clientID         ClientID
+	gc               bool
+	guid             string // guid identifies this document (for subdocument embedding). Defaults to a random uuidv4 (see New) unless set with WithGUID.
+	shouldLoad       bool
+	autoLoad         bool
+	collectionID     string
+	item             *Item // set on integrate when this Doc is embedded as a subdocument (#63)
+	subdocs          map[string]*Doc
+	onSubdocs        []subdocsSub
+	maxPendingItems  int // 0 = use defaultMaxPendingItems; see WithMaxPendingItems and #46
 
 	store *StructStore
 	share map[string]sharedType // named root types

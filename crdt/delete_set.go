@@ -104,6 +104,9 @@ func (ds *DeleteSet) Clients() []ClientID {
 func (ds *DeleteSet) applyToPartial(txn *Transaction) DeleteSet {
 	unresolvable := newDeleteSet()
 	for client, ranges := range ds.clients {
+		if !txn.work(1) || !txn.allocate(uint64(len(ranges))*32+128) {
+			return unresolvable
+		}
 		items := txn.doc.store.clients[client]
 		if len(items) == 0 {
 			// No items for this client — entire set of ranges is unresolvable.
@@ -111,6 +114,9 @@ func (ds *DeleteSet) applyToPartial(txn *Transaction) DeleteSet {
 			continue
 		}
 		for _, r := range ranges {
+			if !txn.work(1) {
+				return unresolvable
+			}
 			// Split at the range boundaries so each overlapping item lies
 			// entirely inside [r.Clock, r.Clock+r.Len). Pre-#72 we deleted
 			// overlapping items whole, which wiped content outside the range
@@ -133,6 +139,9 @@ func (ds *DeleteSet) applyToPartial(txn *Transaction) DeleteSet {
 			})
 			applied := uint64(0)
 			for i := lo; i < len(items); i++ {
+				if !txn.work(1) {
+					return unresolvable
+				}
 				item := items[i]
 				if item.ID.Clock >= r.Clock+r.Len {
 					break

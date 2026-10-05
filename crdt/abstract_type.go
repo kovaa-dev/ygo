@@ -146,6 +146,8 @@ func (t *abstractType) firstLiveFromStart() *Item {
 		node = t.start
 	}
 	for node != nil && node.Deleted {
+		t.localWork()
+
 		node = node.Right
 	}
 	t.firstLiveCache = node
@@ -194,6 +196,8 @@ func (t *abstractType) leftNeighbourAt(index int) (*Item, int) {
 		// moves.
 		var last *Item
 		for it := t.start; it != nil; it = it.Right {
+			t.localWork()
+
 			if countable, _, _ := t.renderedStep(it); countable {
 				last = it
 			}
