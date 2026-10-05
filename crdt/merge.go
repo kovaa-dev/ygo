@@ -1,6 +1,7 @@
 package crdt
 
 import (
+	"fmt"
 	"sort"
 
 	"github.com/reearth/ygo/encoding"
@@ -22,10 +23,13 @@ import (
 // scratch is a throwaway Doc used only to resolve parent type names during
 // per-struct decode; it is never mutated structurally.
 func decodeStructsV1(scratch *Doc, update []byte) (map[ClientID][]*Item, DeleteSet, error) {
-	dec := encoding.NewDecoder(update)
+	return decodeStructsV1Bounded(scratch, encoding.NewDecoder(update), 0)
+}
+
+func decodeStructsV1Bounded(scratch *Doc, dec *encoding.Decoder, maxStructs uint64) (map[ClientID][]*Item, DeleteSet, error) {
 	numClients, err := dec.ReadVarUint()
 	if err != nil {
-		return nil, DeleteSet{}, wrapUpdateErr(err)
+		return nil, DeleteSet{}, fmt.Errorf("%w: %w", ErrInvalidUpdate, err)
 	}
 	if numClients > maxV2Items {
 		return nil, DeleteSet{}, ErrInvalidUpdate
@@ -38,26 +42,35 @@ func decodeStructsV1(scratch *Doc, update []byte) (map[ClientID][]*Item, DeleteS
 	for i := uint64(0); i < numClients; i++ {
 		numStructs, err := dec.ReadVarUint()
 		if err != nil {
-			return nil, DeleteSet{}, wrapUpdateErr(err)
+			return nil, DeleteSet{}, fmt.Errorf("%w: %w", ErrInvalidUpdate, err)
+		}
+		if numStructs > ^uint64(0)-total {
+			return nil, DeleteSet{}, ErrInvalidUpdate
 		}
 		total += numStructs
+		if maxStructs > 0 && total > maxStructs {
+			return nil, DeleteSet{}, encoding.ErrDecodeBudgetExceeded
+		}
 		if total > maxV2Items {
 			return nil, DeleteSet{}, ErrInvalidUpdate
 		}
 		clientU, err := dec.ReadVarUint()
 		if err != nil {
-			return nil, DeleteSet{}, wrapUpdateErr(err)
+			return nil, DeleteSet{}, fmt.Errorf("%w: %w", ErrInvalidUpdate, err)
 		}
 		client := ClientID(clientU)
 		clock, err := dec.ReadVarUint()
 		if err != nil {
-			return nil, DeleteSet{}, wrapUpdateErr(err)
+			return nil, DeleteSet{}, fmt.Errorf("%w: %w", ErrInvalidUpdate, err)
 		}
 		structs := out[client]
 		for j := uint64(0); j < numStructs; j++ {
+			if err := dec.ReserveValues(1); err != nil {
+				return nil, DeleteSet{}, err
+			}
 			item, err := decodeItem(dec, scratch, client, clock)
 			if err != nil {
-				return nil, DeleteSet{}, wrapUpdateErr(err)
+				return nil, DeleteSet{}, fmt.Errorf("%w: %w", ErrInvalidUpdate, err)
 			}
 			clock += uint64(item.Content.Len())
 			// Skip structs are clock-range placeholders, not content. Drop them
@@ -73,7 +86,7 @@ func decodeStructsV1(scratch *Doc, update []byte) (map[ClientID][]*Item, DeleteS
 	}
 	ds, err := decodeDeleteSet(dec)
 	if err != nil {
-		return nil, DeleteSet{}, wrapUpdateErr(err)
+		return nil, DeleteSet{}, fmt.Errorf("%w: %w", ErrInvalidUpdate, err)
 	}
 	return out, ds, nil
 }

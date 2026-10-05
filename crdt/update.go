@@ -951,6 +951,9 @@ func decodeContent(dec *encoding.Decoder, doc *Doc, tag byte) (Content, error) {
 		if n > uint64(dec.Remaining()) {
 			return nil, ErrInvalidUpdate
 		}
+		if err := dec.ReserveValues(2 * n); err != nil {
+			return nil, err
+		}
 		vals := make([]any, n)
 		for i := range vals {
 			if vals[i], err = dec.ReadAny(); err != nil {
@@ -981,6 +984,10 @@ func decodeContent(dec *encoding.Decoder, doc *Doc, tag byte) (Content, error) {
 		if err != nil {
 			return nil, err
 		}
+		// JSON has at most one value/container slot per encoded byte.
+		if err := dec.ReserveValues(uint64(len(js))); err != nil {
+			return nil, err
+		}
 		v, err := fmtValFromJSON(js)
 		if err != nil {
 			return nil, err
@@ -994,6 +1001,9 @@ func decodeContent(dec *encoding.Decoder, doc *Doc, tag byte) (Content, error) {
 		}
 		js, err := dec.ReadVarString()
 		if err != nil {
+			return nil, err
+		}
+		if err := dec.ReserveValues(uint64(len(js))); err != nil {
 			return nil, err
 		}
 		val, err := fmtValFromJSON(js)
@@ -1020,6 +1030,9 @@ func decodeContent(dec *encoding.Decoder, doc *Doc, tag byte) (Content, error) {
 		}
 		if n > uint64(dec.Remaining()) {
 			return nil, ErrInvalidUpdate
+		}
+		if err := dec.ReserveValues(2 * n); err != nil {
+			return nil, err
 		}
 		vals := make([]any, n)
 		for i := range vals {
@@ -1157,6 +1170,9 @@ func decodeDeleteSet(dec *encoding.Decoder) (DeleteSet, error) {
 			}
 			length, err := dec.ReadVarUint()
 			if err != nil {
+				return ds, err
+			}
+			if err := dec.ReserveValues(1); err != nil {
 				return ds, err
 			}
 			ds.clients[client] = append(ds.clients[client], DeleteRange{Clock: clock, Len: length})

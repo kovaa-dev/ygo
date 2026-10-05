@@ -29,8 +29,9 @@ var (
 // Decoder reads values from a byte slice using the lib0 encoding format.
 // Decoder is not safe for concurrent use; each goroutine should use its own instance.
 type Decoder struct {
-	buf []byte
-	pos int
+	buf    []byte
+	pos    int
+	budget *DecodeBudget
 }
 
 // NewDecoder returns a Decoder that reads from b.
@@ -69,6 +70,11 @@ func (d *Decoder) RemainingBytesCopy() []byte {
 }
 
 func (d *Decoder) readByte() (byte, error) {
+	if d.budget != nil {
+		if err := d.budget.check(); err != nil {
+			return 0, err
+		}
+	}
 	if d.pos >= len(d.buf) {
 		return 0, ErrUnexpectedEOF
 	}
@@ -165,6 +171,9 @@ func (d *Decoder) ReadVarBytes() ([]byte, error) {
 	if n > uint64(d.Remaining()) {
 		return nil, ErrUnexpectedEOF
 	}
+	if err := d.ReservePayload(n); err != nil {
+		return nil, err
+	}
 	end := d.pos + int(n)
 	out := d.buf[d.pos:end]
 	d.pos = end
@@ -253,6 +262,9 @@ func (d *Decoder) SkipAny() error {
 }
 
 func (d *Decoder) readAny(depth int, skip bool) (any, error) {
+	if err := d.ReserveValues(1); err != nil {
+		return nil, err
+	}
 	if depth > maxAnyDepth {
 		return nil, ErrDepthExceeded
 	}
@@ -326,6 +338,9 @@ func (d *Decoder) readAny(depth int, skip bool) (any, error) {
 		if n > uint64(d.Remaining()) {
 			return nil, ErrUnexpectedEOF
 		}
+		if err := d.ReserveValues(n); err != nil {
+			return nil, err
+		}
 		var out []any
 		if !skip {
 			out = make([]any, n)
@@ -351,6 +366,9 @@ func (d *Decoder) readAny(depth int, skip bool) (any, error) {
 		}
 		if n > uint64(d.Remaining()) {
 			return nil, ErrUnexpectedEOF
+		}
+		if err := d.ReserveValues(n); err != nil {
+			return nil, err
 		}
 		var out map[string]any
 		if !skip {

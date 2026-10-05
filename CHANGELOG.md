@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Fork snapshot after v1.50.0 — unreleased
+
+### Added
+
+- `crdt.InspectUpdateV1` inspects V1 updates without mutating the target document,
+  using the existing decoder with optional context, struct, value-slot and
+  payload-byte budgets. It reports unresolved ancestry, including existing
+  pending structs. Callers must serialize inspection and application.
+- `encoding.NewDecoderWithBudget` refuses collection/payload work before the
+  corresponding allocation. Budgets describe decoder work, not total heap/RSS.
+
+No wire format, default apply behavior, pending retention or ACK contract changes.
+Inspection is not transactional rollback and unresolved content is not validated.
+This snapshot is maintained in `kovaa-dev/ygo`; no release or upstream PR is made.
+
 ## [1.50.0] — 2026-09-10
 
 ### Added

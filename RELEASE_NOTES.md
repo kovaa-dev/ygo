@@ -1,3 +1,19 @@
+## Fork snapshot after v1.50.0 — unreleased
+
+The fork adds optional read-only V1 inspection and decoder work budgets for the
+One More Dot sync boundary. Existing APIs retain their defaults. Applications
+can refuse malformed or over-budget decoding before mutating a live document.
+
+A successful inspection does not make a subsequent apply atomic. The caller
+must serialize both operations and retain its existing recovery behavior for
+integration errors. Unresolved dependencies are reported explicitly; the API
+neither changes durable acknowledgements nor drops pending data. Product schema
+and the treatment of incomplete updates remain application responsibilities.
+
+The limits account for structs, value slots and length-prefixed payload bytes,
+not total process memory, document size or all integration/encoding work.
+No release/tag or upstream pull request accompanies this fork snapshot.
+
 ## v1.50.0
 
 **Who is affected: nobody, unless you choose to be.** This release adds a
