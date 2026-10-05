@@ -1,4 +1,4 @@
-## v1.51.0
+## Pending release
 
 Resolve dependencies contained in the same complete V1/V2 update before charging its unresolved items to the cross-update pending limit. At that limit, a wire-only dependency preflight rejects oversized incomplete updates before materializing the remaining content. The configured pending limit is unchanged. This release also adds `encoding.Decoder.SkipAny`; it uses the same validation and depth/element limits as `ReadAny`.
 
