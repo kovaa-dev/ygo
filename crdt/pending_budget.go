@@ -98,6 +98,12 @@ func (b *pendingBudget) check(count int) error {
 			}
 		}
 		if s.err != nil {
+			if b.processing != nil {
+				if err := s.rest.BudgetError(); err != nil {
+					b.processing.err = err
+					return err
+				}
+			}
 			return wrapUpdateErr(s.err)
 		}
 		if pending <= b.remaining {

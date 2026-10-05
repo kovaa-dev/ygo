@@ -21,9 +21,13 @@ type DecodeBudget struct {
 	payload         uint64
 	Reserve         func(uint64) error
 	CopyPayload     bool
+	err             error
 }
 
 func (b *DecodeBudget) check() error {
+	if b.err != nil {
+		return b.err
+	}
 	if b.Context != nil {
 		return b.Context.Err()
 	}
@@ -50,10 +54,15 @@ func NewDecoderWithBudget(data []byte, budget *DecodeBudget) *Decoder {
 // ReserveValues reserves value slots before callers allocate outer content
 // containers. Nested values also consume slots, conservatively counting both
 // container entries and the values decoded into them.
-func (d *Decoder) ReserveValues(n uint64) error {
+func (d *Decoder) ReserveValues(n uint64) (resultErr error) {
 	if d.budget == nil {
 		return nil
 	}
+	defer func() {
+		if resultErr != nil && d.budget.err == nil {
+			d.budget.err = resultErr
+		}
+	}()
 	if d.budget.Work != nil {
 		if err := d.budget.Work(n); err != nil {
 			return err
@@ -73,10 +82,15 @@ func (d *Decoder) ReserveValues(n uint64) error {
 
 // ReservePayload reserves payload bytes before a caller materializes data that
 // is not read through ReadVarBytes. ReadVarBytes already performs this charge.
-func (d *Decoder) ReservePayload(n uint64) error {
+func (d *Decoder) ReservePayload(n uint64) (resultErr error) {
 	if d.budget == nil {
 		return nil
 	}
+	defer func() {
+		if resultErr != nil && d.budget.err == nil {
+			d.budget.err = resultErr
+		}
+	}()
 	if d.budget.Work != nil {
 		if err := d.budget.Work(n); err != nil {
 			return err
@@ -96,10 +110,15 @@ func (d *Decoder) ReservePayload(n uint64) error {
 
 // ReserveAllocation admits content-specific fixed/container allocations without
 // consuming decoded value or payload counters. Legacy decoders ignore it.
-func (d *Decoder) ReserveAllocation(n uint64) error {
+func (d *Decoder) ReserveAllocation(n uint64) (resultErr error) {
 	if d.budget == nil {
 		return nil
 	}
+	defer func() {
+		if resultErr != nil && d.budget.err == nil {
+			d.budget.err = resultErr
+		}
+	}()
 	if err := d.budget.check(); err != nil {
 		return err
 	}
@@ -107,4 +126,13 @@ func (d *Decoder) ReserveAllocation(n uint64) error {
 		return d.budget.Reserve(n)
 	}
 	return nil
+}
+
+// BudgetError returns the first operational budget failure independently of
+// content decoders that may wrap parser errors without preserving their cause.
+func (d *Decoder) BudgetError() error {
+	if d.budget == nil {
+		return nil
+	}
+	return d.budget.err
 }

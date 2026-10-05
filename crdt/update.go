@@ -484,6 +484,12 @@ func applyV1Txn(txn *Transaction, update []byte) (retErr error) {
 	dec := encoding.NewDecoder(update)
 	if txn.budget != nil {
 		dec = encoding.NewDecoderWithBudget(update, txn.budget.decoder())
+		defer func() {
+			if err := dec.BudgetError(); err != nil {
+				txn.budget.err = err
+				retErr = err
+			}
+		}()
 	}
 
 	// Snapshot state vector before applying anything (used for skip/offset logic).

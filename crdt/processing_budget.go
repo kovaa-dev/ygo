@@ -148,6 +148,11 @@ func (doc *Doc) TransactWithBudget(fn func(*Transaction) error, budget *Processi
 				err = fmt.Errorf("%w: budgeted integration panic: %v", ErrInvalidUpdate, v)
 			}
 		}
+		// Legacy decoder helpers may wrap nested failures as invalid-update text.
+		// The budget owns the original refusal and must preserve its identity.
+		if budget.err != nil {
+			err = budget.err
+		}
 	}()
 	if err = fn(txn); err != nil {
 		return err

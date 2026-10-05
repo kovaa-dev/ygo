@@ -63,7 +63,28 @@ type UpdateInspectionResult struct {
 // supplied values. A successful inspection does NOT make a later ApplyUpdateV1
 // atomic: callers must serialize inspect/apply and preserve the existing apply
 // error contract. In particular unresolved ancestry must not be called validated.
-func InspectUpdateV1(doc *Doc, update []byte, options UpdateInspectionOptions, visit func(InspectedItem) error) (UpdateInspectionResult, error) {
+func InspectUpdateV1(doc *Doc, update []byte, options UpdateInspectionOptions, visit func(InspectedItem) error) (inspectionResult UpdateInspectionResult, resultErr error) {
+	var reserveErr error
+	originalReserve := options.Reserve
+	if originalReserve != nil {
+		options.Reserve = func(n uint64) error {
+			if reserveErr != nil {
+				return reserveErr
+			}
+			reserveErr = originalReserve(n)
+			return reserveErr
+		}
+	}
+	defer func() {
+		if reserveErr != nil {
+			inspectionResult = UpdateInspectionResult{}
+			resultErr = reserveErr
+		} else if resultErr != nil && options.Context != nil && options.Context.Err() != nil {
+			inspectionResult = UpdateInspectionResult{}
+			resultErr = options.Context.Err()
+		}
+	}()
+
 	ctx := options.Context
 	if ctx == nil {
 		ctx = context.Background()
@@ -73,6 +94,12 @@ func InspectUpdateV1(doc *Doc, update []byte, options UpdateInspectionOptions, v
 	}
 	budget := &encoding.DecodeBudget{Context: ctx, MaxValues: options.MaxValues, MaxPayloadBytes: options.MaxPayloadBytes, Reserve: options.Reserve}
 	dec := encoding.NewDecoderWithBudget(update, budget)
+	defer func() {
+		if err := dec.BudgetError(); err != nil {
+			inspectionResult = UpdateInspectionResult{}
+			resultErr = err
+		}
+	}()
 	if err := dec.ReserveAllocation(16384); err != nil {
 		return UpdateInspectionResult{}, err
 	}
