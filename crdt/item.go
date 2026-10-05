@@ -474,6 +474,12 @@ func splitItem(txn *Transaction, item *Item, offset int) *Item {
 		right.Right.Left = right
 	}
 	item.Right = right
+	// Splitting the current keyed item moves the rightmost clock to the new
+	// half. Keep itemMap pointing there, including for compacted tombstones,
+	// so the uncontested-key fast path cannot skip a same-key successor.
+	if item.ParentSub != nil && item.Parent != nil && item.Parent.itemMap[*item.ParentSub] == item {
+		item.Parent.itemMap[*item.ParentSub] = right
+	}
 	txn.doc.store.insertItem(right)
 	// A split does not move any rendered position — the two halves occupy exactly
 	// the range the original item did, and a marker pointing at the original
