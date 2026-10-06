@@ -2,6 +2,49 @@
 
 Resolve dependencies contained in the same complete V1/V2 update before charging its unresolved items to the cross-update pending limit. At that limit, a wire-only dependency preflight rejects oversized incomplete updates before materializing the remaining content. The configured pending limit is unchanged. This release also adds `encoding.Decoder.SkipAny`; it uses the same validation and depth/element limits as `ReadAny`.
 
+## v1.51.0
+
+**Who is affected:** anyone who applies *merged* updates one at a time with
+`ApplyUpdateV1` or `ApplyUpdateV2` — for example a custom persistence adapter
+that replays its stored log on load, or a peer that receives the output of
+`MergeUpdatesV1` / yjs `mergeUpdates`. If your adapter rebuilds documents by
+merging its whole log first (every adapter bundled with ygo does), you were not
+affected on load. Applications that compact a stored log by merging rows were
+affected, and so were yjs clients loading a snapshot such a document produced.
+
+**What went wrong.** Merging two updates from the same client that are not
+consecutive — say its 1st and 3rd edits — produces an update with a marker
+saying "clocks withheld here". ygo read that marker the wrong way round, as
+"the receiver already has these". So when the 2nd edit arrived, ygo believed it
+already had it and threw it away. Nothing reported an error; the document was
+just missing that edit, permanently. Worse, a snapshot of that document
+(`EncodeStateAsUpdateV1`) was malformed, and yjs threw a `TypeError` loading it.
+
+The websocket server can produce these merges itself: it batches persistence
+writes, and when several goroutines commit to one room concurrently their
+updates can reach the batcher out of order.
+
+**What changed.** Edits after the marker now wait until the missing range
+arrives, then apply — the same outcome as yjs, in either arrival order.
+
+**Upgrading.** No API change. Documents already rebuilt with an edit missing
+are not repaired by upgrading; if the original update log is still stored,
+reloading from it with this version restores the edit.
+
+**Also fixed: the V1/V2 format converters.** `UpdateV1ToV2` and
+`UpdateV2ToV1` only worked on a document's *first* update. Anything later — an
+ordinary incremental edit, or an update that only deletes — came back as an
+empty update, with no error. If you convert updates between formats at an edge
+(for example to talk to a V2 client), those edits never reached the other side.
+Both now produce exactly the bytes yjs's own converters do.
+
+**Also fixed: snapshots taken while an update is waiting.** When an update
+arrives before one it depends on, ygo holds it until the missing one shows up.
+`EncodeStateAsUpdateV1`/`V2` used to leave held updates out, so a snapshot
+taken in that window — a compaction, or a sync reply to a new peer — lost them
+for good. Snapshots now include them, byte for byte as yjs does. Thanks to
+@sjawhar for the report and reproduction.
+
 ## v1.50.0
 
 **Who is affected: nobody, unless you choose to be.** This release adds a
