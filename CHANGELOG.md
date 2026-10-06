@@ -11,6 +11,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Avoid scanning unrelated map keys when a replacement is placed immediately after the previous rightmost value of that key. Concurrent replacements still use the existing conflict resolution path.
 
+## [1.51.0] — 2026-10-06
+
+### Fixed
+
+- **`crdt`: an update carrying a skip struct silently lost the content that
+  later filled the gap (#251).** A skip struct marks clocks the sender
+  withheld. Both `ApplyUpdateV1` and `ApplyUpdateV2` treated it as the
+  opposite — clocks the receiver already had — and advanced the client's
+  clock over the hole. Structs after the skip integrated with no predecessor,
+  and the update that later filled the gap was discarded as already
+  integrated. No error was returned. The doc's encoded state was also
+  corrupt: it renumbered the post-skip structs into the hole, so yjs threw
+  `TypeError` (in `Item.getMissing`) applying it.
+
+  Skip structs come from merging non-contiguous updates from one client
+  (`MergeUpdatesV1`/`MergeUpdatesV2`, or yjs's `mergeUpdates`, whose output is
+  byte-identical). The websocket persistence worker produces such merges when
+  concurrent committers enqueue out of clock order across a coalescing flush,
+  so an adapter that replays its stored log update by update could lose
+  writes. The bundled adapters rebuild with `MergeUpdatesV1` over the whole log,
+  which heals the gap, so they were not affected on load.
+
+  Structs after a skip now park until the missing range arrives, matching yjs
+  13.6.30 in both arrival orders. `TestUnit_ApplyUpdateV1_SkipStruct` asserted
+  the old behaviour and now asserts yjs's.
+
+- **`crdt`: `UpdateV1ToV2` and `UpdateV2ToV1` returned an empty update for any
+  incremental or delete-only input.** Both converted by integrating into a
+  scratch doc and re-encoding its state, so structs whose clocks did not start
+  at 0 parked there and a delete set naming items the scratch doc lacked was
+  dropped. They now convert at the struct level, like `MergeUpdatesV1`, and
+  match yjs's `convertUpdateFormatV1ToV2` / `convertUpdateFormatV2ToV1` byte
+  for byte. Only a first, self-contained update converted correctly before.
+
+- **`crdt`: `EncodeStateAsUpdateV1`/`V2` left out structs and deletions still
+  parked on a missing dependency.** A snapshot taken while anything was parked
+  lost it for good once the filler arrived. Both now merge in the parked
+  structs and delete set, as yjs's `encodeStateAsUpdate` does with
+  `pendingStructs`/`pendingDs`, and match its output byte for byte. `OnUpdate`
+  payloads are unchanged. Reported with a reproduction by @sjawhar on #257.
+
 ## [1.50.0] — 2026-09-10
 
 ### Added
