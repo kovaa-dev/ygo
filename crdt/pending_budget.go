@@ -1,6 +1,9 @@
 package crdt
 
 import (
+	"bytes"
+	"encoding/json"
+	"strconv"
 	"unicode/utf8"
 
 	"github.com/reearth/ygo/encoding"
@@ -288,11 +291,30 @@ func (s *pendingScanner) content(tag byte) uint64 {
 			s.err = ErrInvalidUpdate
 			return 0
 		}
-		for i := uint64(0); i < n && s.err == nil; i++ {
-			if tag == wireJSON && s.v2 != nil {
-				s.text()
+		if tag == wireJSON && s.v2 == nil {
+			// Match decodeContent's whole-item JSON-first legacy fallback,
+			// without constructing the values or their nested object trees.
+			probe := *s.rest
+			jsonErr := skipJSONVals(&probe, n)
+			if jsonErr == nil {
+				*s.rest = probe
+			} else if n > 0 && isAnyTag(s.rest.RemainingBytes()[0]) {
+				for i := uint64(0); i < n && s.err == nil; i++ {
+					s.any()
+				}
+				if s.err != nil {
+					s.err = jsonErr
+				}
 			} else {
-				s.any()
+				s.err = jsonErr
+			}
+		} else {
+			for i := uint64(0); i < n && s.err == nil; i++ {
+				if tag == wireJSON {
+					s.text()
+				} else {
+					s.any()
+				}
 			}
 		}
 		return n
@@ -338,4 +360,45 @@ func (s *pendingScanner) content(tag byte) uint64 {
 		s.err = ErrInvalidUpdate
 	}
 	return 1
+}
+
+// skipJSONVals validates V1 JSON text without allocating decoded values.
+func skipJSONVals(dec *encoding.Decoder, n uint64) error {
+	for i := uint64(0); i < n; i++ {
+		raw, err := dec.ReadVarBytes()
+		if err != nil {
+			return err
+		}
+		if !utf8.Valid(raw) {
+			return encoding.ErrInvalidUTF8
+		}
+		if bytes.Equal(raw, []byte("undefined")) {
+			continue
+		}
+		if !json.Valid(raw) {
+			return ErrInvalidUpdate
+		}
+		// Unmarshal rejects numbers outside float64's range. Preserve that
+		// decision too: it determines the legacy fallback for ambiguous
+		// 116–127-byte strings. JSON syntax is already validated above.
+		for j := 0; j < len(raw); j++ {
+			if raw[j] == '"' {
+				for j++; raw[j] != '"'; j++ {
+					if raw[j] == '\\' {
+						j++
+					}
+				}
+			} else if raw[j] == '-' || raw[j] >= '0' && raw[j] <= '9' {
+				start := j
+				for j < len(raw) && (raw[j] >= '0' && raw[j] <= '9' || raw[j] == '-' || raw[j] == '+' || raw[j] == '.' || raw[j] == 'e' || raw[j] == 'E') {
+					j++
+				}
+				if _, err := strconv.ParseFloat(string(raw[start:j]), 64); err != nil {
+					return ErrInvalidUpdate
+				}
+				j--
+			}
+		}
+	}
+	return nil
 }

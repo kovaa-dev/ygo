@@ -2,9 +2,12 @@ package crdt
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/reearth/ygo/encoding"
 )
 
 // Use the real codecs with many separate keyed structs: missing-parent updates
@@ -165,5 +168,49 @@ func TestUnit_PendingScanner_ContentCursor(t *testing.T) {
 		require.Zero(t, s.uint(), "delete set remains aligned")
 		require.Zero(t, s.rest.Remaining())
 		require.NoError(t, s.err)
+	}
+}
+
+func TestUnit_PendingScanner_ContentJSONV1MatchesDecoder(t *testing.T) {
+	values := [][]any{
+		{}, {nil, "tail"}, {"a", 7, map[string]any{"quoted": "1e9999\\\"", "number": 2}},
+	}
+	for n := 116; n <= 127; n++ {
+		values = append(values, []any{strings.Repeat("a", n-2), "tail"})
+	}
+	for i, vals := range values {
+		enc := encoding.NewEncoder()
+		encodeContent(enc, NewContentJSON(vals...), 0)
+		for name, data := range map[string][]byte{
+			"json": enc.Bytes(), "legacy": legacyContentJSONV1(vals...),
+		} {
+			t.Run(fmt.Sprintf("%s/%d", name, i), func(t *testing.T) {
+				data = append(append([]byte(nil), data...), 0x42)
+				dec := encoding.NewDecoder(data)
+				_, err := decodeContent(dec, nil, wireJSON)
+				require.NoError(t, err)
+				s := &pendingScanner{rest: encoding.NewDecoder(data)}
+				require.EqualValues(t, len(vals), s.content(wireJSON))
+				require.NoError(t, s.err)
+				require.Equal(t, dec.RemainingBytes(), s.rest.RemainingBytes())
+				require.Equal(t, []byte{0x42}, s.rest.RemainingBytes())
+			})
+		}
+	}
+	for _, value := range []string{"undefined", "1e9999", "[1e9999]", "{", "\xff", strings.Repeat(" ", 118) + "1e9999", `{"s":"1e9999","v":3}`} {
+		t.Run(value, func(t *testing.T) {
+			enc := encoding.NewEncoder()
+			enc.WriteVarUint(1)
+			enc.WriteVarBytes([]byte(value))
+			data := enc.Bytes()
+			dec := encoding.NewDecoder(data)
+			_, wantErr := decodeContent(dec, nil, wireJSON)
+			s := &pendingScanner{rest: encoding.NewDecoder(data)}
+			s.content(wireJSON)
+			require.Equal(t, wantErr == nil, s.err == nil)
+			if wantErr == nil {
+				require.Equal(t, dec.RemainingBytes(), s.rest.RemainingBytes())
+			}
+		})
 	}
 }
