@@ -14,6 +14,8 @@ everyone else for good. Accessing a root now picks up waiting updates too.
 
 ## v1.51.1
 
+Avoid repeated prefix scans when collecting sparse transaction delete ranges. The range starts at the containing struct found by binary search; partial overlaps and tombstones retain their existing behavior.
+
 **Who is affected:** anyone using `UndoManager` or `YArray.Move`, and anyone
 exchanging V1 updates with yjs peers that carry legacy JSON content.
 
