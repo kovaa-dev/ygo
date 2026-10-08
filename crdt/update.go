@@ -669,107 +669,25 @@ func decodeAndPark(txn *Transaction, dec *encoding.Decoder, sv StateVector, numC
 	return pending, nil
 }
 
-// resolveWithinUpdatePending takes the items deferred during decoding
-// (those whose parent might resolve via later items in the same update)
-// and runs a fixed-point loop: try to integrate each item by resolving its
-// parent from the store. If progress was made, try again with the remaining
-// items. When no progress is made, partition survivors into future-clock
-// (park in store.pending) vs truly-unresolvable (orphan-Append).
-// Returns ErrInvalidUpdate (wrapped) if the pending queue cap is exceeded.
+// resolveWithinUpdatePending retries deferred items within this update. Large
+// queues first try one ordinary pass, then integrate in-message producers before
+// their dependents. Small queues and unresolved leftovers use fixed-point retries.
+// Survivors are parked within the existing cross-update pending limit.
 func resolveWithinUpdatePending(txn *Transaction, pending []*Item) error {
-	// Retry items whose parent couldn't be resolved during the first pass
-	// because their origin items were in a later client group.
-	for len(pending) > 0 {
-		var remaining []*Item
-		for _, item := range pending {
-			if item.Origin != nil {
-				if oi := txn.doc.store.Find(*item.Origin); oi != nil {
-					item.Parent = oi.Parent
-					// A keyed (map) item with an origin carries no on-wire
-					// ParentSub — it inherits the key from its origin. Without
-					// this, the item integrates keyless (as a sequence element),
-					// vanishes from itemMap, and the map key is silently lost.
-					// Matches decodeItem, the doc-level drain, and the V2 decoder.
-					// (#YMap-wire)
-					if item.ParentSub == nil {
-						item.ParentSub = oi.ParentSub
-					}
-				}
-			}
-			if item.Parent == nil && item.OriginRight != nil {
-				if ori := txn.doc.store.Find(*item.OriginRight); ori != nil {
-					item.Parent = ori.Parent
-					if item.ParentSub == nil {
-						item.ParentSub = ori.ParentSub
-					}
-				}
-			}
-			// Parent referenced by container item-ID (review finding C-3): now
-			// that earlier groups in this update have integrated, the container
-			// may exist. Resolve precisely BEFORE the ParentSub fallback below,
-			// which would otherwise graft this keyed item onto an arbitrary map.
-			if item.Parent == nil && item.parentID != nil {
-				if pi := txn.doc.store.Find(*item.parentID); pi != nil {
-					// A non-ContentType here means the container was tombstoned/
-					// GC'd (its ContentType replaced by a ContentDeleted
-					// placeholder). Leave Parent nil so the item orphan-drops
-					// (Yjs parent=nil) rather than aborting the whole update.
-					if ct, ok := pi.Content.(*ContentType); ok {
-						item.Parent = ct.Type
-					}
-				}
-			}
-			// A keyed item whose parent is still unresolved here is a genuine
-			// orphan: its origin/container was deleted and GC'd, so the parent
-			// type is gone. Yjs integrates such an item as a no-op (parent=nil)
-			// and drops it on every peer. Do NOT graft it onto some arbitrary
-			// map found by scanning the store — that lands the orphan on a
-			// different (or no) parent depending on integration order and Go map
-			// iteration, causing peers to diverge (#156). Leave Parent nil and
-			// let it fall through to the orphan-Append path below.
-			if item.Parent != nil {
-				// A resolved parent is not sufficient: the item may still depend
-				// on a not-yet-integrated origin/rightOrigin clock (review finding
-				// C-2). Integrating now would place it at the wrong position
-				// (permanent divergence). Defer it to `remaining` so the
-				// no-progress branch below parks it via itemFutureDep for retry
-				// when the missing client arrives.
-				if _, _, isFuture := itemFutureDep(item, txn.doc.store); isFuture {
-					remaining = append(remaining, item)
-					continue
-				}
-				if item.Origin != nil {
-					item.Left = txn.doc.store.getItemCleanEnd(txn, item.Origin.Client, item.Origin.Clock)
-				}
-				item.integrate(txn, 0)
-			} else {
-				remaining = append(remaining, item)
-			}
+	if len(pending) >= pendingScheduleThreshold {
+		before := len(pending)
+		pending = retryWithinUpdatePending(txn, pending)
+		if len(pending) == before {
+			return parkWithinUpdatePending(txn, pending)
 		}
+	}
+	if len(pending) >= pendingScheduleThreshold {
+		pending = resolvePendingDependencies(txn, pending)
+	}
+	for len(pending) > 0 {
+		remaining := retryWithinUpdatePending(txn, pending)
 		if len(remaining) == len(pending) {
-			// No progress made. Partition `remaining` into two buckets:
-			//   - Future-clock references -> park in store.pending for retry
-			//     when the missing updates arrive (fixes #11).
-			//   - Truly unresolvable (e.g. GC'd parents with lost parent info
-			//     from the Yjs wire format) -> store without integration so
-			//     they survive re-encoding. Matches the pre-#11 fallback.
-			for _, item := range remaining {
-				if client, parkedAt, isFuture := itemFutureDep(item, txn.doc.store); isFuture {
-					if txn.doc.store.pending != nil && len(txn.doc.store.pending.items) >= txn.doc.maxPendingItemsLimit() {
-						return wrapUpdateErr(ErrInvalidUpdate)
-					}
-					if txn.doc.store.pending == nil {
-						txn.doc.store.pending = &pendingUpdate{
-							missing: make(StateVector),
-						}
-					}
-					txn.doc.store.pending.items = append(txn.doc.store.pending.items, item)
-					mergePendingMissing(txn.doc.store.pending.missing, client, parkedAt)
-				} else {
-					txn.doc.store.Append(item)
-				}
-			}
-			break
+			return parkWithinUpdatePending(txn, remaining)
 		}
 		pending = remaining
 	}

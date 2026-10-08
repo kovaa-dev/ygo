@@ -1,3 +1,16 @@
+## v1.51.3
+
+Large updates whose structs depend on later client groups restore much faster.
+The within-update resolver processes dependencies before their consumers instead
+of repeatedly scanning a reverse chain. Queues already resolvable in one pass,
+and queues waiting entirely on missing data, avoid allocating the search index.
+Complex queues use temporary storage proportional to the remaining item count;
+unresolved and overlapping cases retain the existing retry fallback.
+
+No public API or wire-format change. The configured persistent pending limit
+and cross-update drain behavior are unchanged. This optimization is separate
+from the pending-budget preflight fix in #260.
+
 ## v1.51.2
 
 **Who is affected:** servers and clients that call `GetText`, `GetArray`,

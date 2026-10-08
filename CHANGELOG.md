@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.51.3] — 2026-10-08
+
+### Changed
+
+- Resolve large within-update dependency queues in producer-first order,
+  avoiding repeated full-queue retries on reverse client chains. Queues that
+  resolve in one pass or make no progress do not allocate a dependency index.
+  The sorted index stores immutable ranges and uses temporary memory
+  proportional to the remaining queue. Unresolved and overlapping ranges
+  retain fixed-point retries and the existing persistent pending limit.
+  Public API, wire format and cross-update drain behavior are unchanged.
+
 ## [1.51.2] — 2026-10-08
 
 ### Fixed
