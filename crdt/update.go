@@ -714,43 +714,25 @@ func decodeAndPark(txn *Transaction, dec *encoding.Decoder, sv StateVector, numC
 	return pending, nil
 }
 
-// resolveWithinUpdatePending retries items deferred during decoding until
-// no more dependencies resolve. tryIntegrate also stores genuine GC orphans
-// without attaching them to a root, and respects same-client clock gaps.
-// Survivors are parked in store.pending within the cross-update limit.
-// Preflight bounds unresolved items before decoding an oversized blocked tail;
-// this integration loop still uses the existing fixed-point traversal.
-// Returns ErrInvalidUpdate (wrapped) if the pending queue cap is exceeded.
+// resolveWithinUpdatePending retries deferred items within this update. Large
+// queues first try one ordinary pass, then integrate in-message producers before
+// their dependents. Small queues and unresolved leftovers use fixed-point retries.
+// Survivors are parked within the existing cross-update pending limit.
 func resolveWithinUpdatePending(txn *Transaction, pending []*Item) error {
-	for len(pending) > 0 {
-		remaining := pending[:0]
-		for _, item := range pending {
-			if !txn.work(1) {
-				return txn.budget.err
-			}
-			if !tryIntegrate(txn, item) {
-				remaining = append(remaining, item)
-			}
+	if len(pending) >= pendingScheduleThreshold {
+		before := len(pending)
+		pending = retryWithinUpdatePending(txn, pending)
+		if len(pending) == before {
+			return parkWithinUpdatePending(txn, pending)
 		}
+	}
+	if len(pending) >= pendingScheduleThreshold {
+		pending = resolvePendingDependencies(txn, pending)
+	}
+	for len(pending) > 0 {
+		remaining := retryWithinUpdatePending(txn, pending)
 		if len(remaining) == len(pending) {
-			for _, item := range remaining {
-				if !txn.work(1) {
-					return txn.budget.err
-				}
-				if txn.doc.store.pending != nil && len(txn.doc.store.pending.items) >= txn.doc.maxPendingItemsLimit() {
-					return wrapUpdateErr(ErrInvalidUpdate)
-				}
-				if txn.doc.store.pending == nil {
-					txn.doc.store.pending = &pendingUpdate{missing: make(StateVector)}
-				}
-				txn.doc.store.pending.items = append(txn.doc.store.pending.items, item)
-				if client, parkedAt, future := itemFutureDep(item, txn.doc.store); future {
-					mergePendingMissing(txn.doc.store.pending.missing, client, parkedAt)
-				} else {
-					mergePendingMissing(txn.doc.store.pending.missing, item.ID.Client, txn.doc.store.NextClock(item.ID.Client))
-				}
-			}
-			break
+			return parkWithinUpdatePending(txn, remaining)
 		}
 		pending = remaining
 	}

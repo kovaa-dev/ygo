@@ -39,15 +39,25 @@ func newPendingBudget(doc *Doc, initial StateVector, update []byte, v2 bool, pro
 }
 
 func (b *pendingBudget) scanner() *pendingScanner {
+	var s *pendingScanner
 	if b.v2Start == nil {
-		return newPendingScanner(b.update, b.v2)
+		s = newPendingScanner(b.update, b.v2)
+	} else {
+		v2 := *b.v2Start
+		rest := b.v2Rest
+		v2.restDec = &rest
+		s = &pendingScanner{v2: &v2, rest: &rest}
 	}
-	// Column cursors copy by value; the immutable columns and string pool are
-	// shared with the real decoder. Only the raw rest cursor needs rebinding.
-	v2 := *b.v2Start
-	rest := b.v2Rest
-	v2.restDec = &rest
-	return &pendingScanner{v2: &v2, rest: &rest}
+	s.processing = b.processing
+	if b.processing != nil && !b.v2 {
+		if b.decodeBudget == nil {
+			b.decodeBudget = b.processing.decoder()
+			b.decodeBudget.CopyPayload = false // wire-only validation owns no values
+		}
+		s.decodeBudget = b.decodeBudget
+		s.rest = encoding.NewDecoderWithBudget(b.update, b.decodeBudget)
+	}
+	return s
 }
 
 func (b *pendingBudget) check(count int) error {
@@ -56,6 +66,9 @@ func (b *pendingBudget) check(count int) error {
 	}
 	if b.remaining < 0 {
 		return ErrInvalidUpdate
+	}
+	if !b.processing.allocate(uint64(len(b.initial))*128 + 128) {
+		return b.processing.err
 	}
 	known := make(StateVector, len(b.initial))
 	for client, clock := range b.initial {
@@ -82,6 +95,9 @@ func (b *pendingBudget) check(count int) error {
 	}
 	// The validated head count bounds this allocation. Exact capacity avoids
 	// keeping successive large backing arrays alive on fragmented updates.
+	if !b.processing.allocate(uint64(heads)*1536 + 256) {
+		return b.processing.err
+	}
 	groups := make([]pendingGroup, 0, heads)
 	result, err := scanPendingGroups(b.scanner(), known, b.remaining, groups, true)
 	if err != nil {
@@ -89,13 +105,16 @@ func (b *pendingBudget) check(count int) error {
 	}
 	groups = result.groups
 	if len(groups) > 0 {
-		if err := resolvePendingGroups(groups, known); err != nil {
+		if err := resolvePendingGroups(groups, known, b.processing); err != nil {
 			return wrapUpdateErr(err)
 		}
 		pending := 0
 		for i := range groups {
 			g := &groups[i]
 			for !g.done {
+				if !b.processing.step(1) {
+					return b.processing.err
+				}
 				if g.end > known.Clock(g.client) {
 					pending++
 					if pending > b.remaining {
@@ -126,6 +145,9 @@ func scanPendingGroups(s *pendingScanner, known StateVector, remaining int, grou
 	}
 	var total uint64
 	for i := uint64(0); i < clients && s.err == nil; i++ {
+		if !s.processing.step(1) {
+			return result, s.processing.err
+		}
 		n := s.uint()
 		total += n
 		if total > maxV2Items {
@@ -147,6 +169,9 @@ func scanPendingGroups(s *pendingScanner, known StateVector, remaining int, grou
 					}
 				}
 				if ready {
+					if _, exists := known[client]; !exists && !s.processing.allocate(128) {
+						return result, s.processing.err
+					}
 					known[client] = end
 					result.progressed = true
 				} else {
@@ -243,10 +268,12 @@ func (g *pendingGroup) missing(known StateVector) (ClientID, uint64, bool) {
 // buffer; V2 uses its normal column decoder without building a key dictionary
 // or decoding Any/JSON values into object trees.
 type pendingScanner struct {
-	rest *encoding.Decoder
-	v2   *v2Decoder
-	keys int
-	err  error
+	processing   *ProcessingBudget
+	decodeBudget *encoding.DecodeBudget
+	rest         *encoding.Decoder
+	v2           *v2Decoder
+	keys         int
+	err          error
 }
 
 func newPendingScanner(update []byte, v2 bool) *pendingScanner {
@@ -323,10 +350,10 @@ func (s *pendingScanner) bytes() {
 func (s *pendingScanner) any() {
 	if s.err == nil {
 		rest := s.rest.RemainingBytes()
-		consumed, err := anycodec.Skip(rest)
+		consumed, err := anycodec.SkipWithBudget(rest, s.decodeBudget)
 		// Keep the existing pointer (also v2.restDec), resetting its buffer to
 		// the unread suffix. This advances without re-reading every skipped byte.
-		*s.rest = *encoding.NewDecoder(rest[consumed:])
+		*s.rest = *encoding.NewDecoderWithBudget(rest[consumed:], s.decodeBudget)
 		s.err = err
 	}
 }
@@ -381,6 +408,10 @@ func (s *pendingScanner) key() {
 	}
 }
 func (s *pendingScanner) item() (length uint64, skip bool, deps [3]ID, numDeps int) {
+	if !s.processing.step(1) {
+		s.err = s.processing.err
+		return
+	}
 	var info byte
 	if s.err != nil {
 		return

@@ -507,3 +507,96 @@ geomean                                                                  98.09k 
 ```
 
 </details>
+## Within-update dependency resolver
+
+This comparison targets the resolver-only branch against main `07bd8f62`,
+without #260's pending-budget preflight or decoder refactor. V1 and V2 share the
+same resolver. Large queues first try one ordinary pass; all-ready and
+no-progress queues avoid the index. Remaining large queues use sorted immutable
+ranges, visit-state bytes and an explicit DFS stack, with no per-client map.
+There is at most one index build per call. On 64-bit systems its three flat
+arrays use about 41 bytes per indexed item, plus allocation rounding.
+
+Unresolved and overlapping ranges retain fixed-point retries. The reverse-chain
+speedup is not a universal linear-time guarantee for whole Apply. Persistent
+pending limits, wire format, exported API and cross-update drains are unchanged.
+The separate checkpoint-budget fix is #260; both branches touch the resolver
+call sites and next-patch release entries, so merge ordering needs coordination.
+The combined implementation was also checked locally with a Go overlay over #260.
+
+Apple M4 Pro, macOS arm64, Go 1.26.8. Main and resolver use identical checked-in
+benchmark fixtures, built into frozen test binaries. Timing/B/op/allocs are
+medians of ten fresh-process samples, alternating old/new order. Complete chains
+and checkpoints use `-benchtime=1x`; ordinary Apply and keyed controls use
+`100ms`. Destination creation/destruction and result checks are outside the
+complete/keyed timers. All complete cases succeed with zero rejections; accepted
+missing queues retain exactly the expected pending item count.
+
+Peak RSS is the largest of three separate fresh native `/usr/bin/time -l`
+processes per variant. They load identical prepared wire files, run one GC,
+create one destination and apply the update. Runtime/input/document are included;
+fixture generation and build are excluded. RSS is peak footprint; MiB/op is
+cumulative allocation, not live heap. MiB = 1048576 bytes.
+
+Ordinary Apply timing changes are not statistically significant (n=10).
+The keyed V1 control remains about 9.7 s and 11.5 GiB allocated in both variants;
+a sampled allocation profile attributes about 99% of that volume to unchanged
+`Item.integrate`. Its maximum-of-three RSS rises from 25.609 to 27.406 MiB;
+this PR does not claim every memory metric improves in every workload. The keyed
+V2 control has unchanged B/op and allocation count. Missing keyed queues avoid
+building the search index and allocate about 12% fewer bytes than main.
+
+| Scenario | main ms/op | Resolver ms/op | main MiB/op | Resolver MiB/op | main allocs/op | Resolver allocs/op | main peak RSS MiB | Resolver peak RSS MiB |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| PendingReverseChain/V1/n=1000/cap=16 | 5.400728 | 0.540104 | 10.744484 | 0.575699 | 14,901.0 | 5,083.0 | 11.000 | 5.844 |
+| PendingReverseChain/V1/n=1000/cap=1001 | 5.135980 | 0.293000 | 10.744476 | 0.575699 | 14,900.5 | 5,083.0 | 10.625 | 5.766 |
+| PendingReverseChain/V1/n=20000/cap=16 | 2950.461125 | 7.332833 | 6487.447395 | 11.011459 | 448,931.0 | 100,413.0 | 21.203 | 15.938 |
+| PendingReverseChain/V1/n=20000/cap=20001 | 2920.717833 | 6.902020 | 6487.438744 | 11.011307 | 448,911.5 | 100,412.0 | 19.984 | 15.812 |
+| PendingReverseChain/V2/n=1000/cap=16 | 5.228668 | 0.306333 | 10.744949 | 0.581253 | 14,921.0 | 5,110.0 | 10.359 | 5.891 |
+| PendingReverseChain/V2/n=1000/cap=1001 | 5.246208 | 0.297709 | 10.745056 | 0.581253 | 14,922.0 | 5,110.0 | 10.656 | 5.594 |
+| PendingReverseChain/V2/n=20000/cap=16 | 2927.126126 | 7.233605 | 6487.547356 | 11.121353 | 448,935.5 | 100,439.0 | 19.750 | 16.031 |
+| PendingReverseChain/V2/n=20000/cap=20001 | 2949.614459 | 7.254978 | 6487.547188 | 11.121353 | 448,933.5 | 100,439.0 | 20.172 | 15.859 |
+| PendingManyClientCheckpoint/V2/n=10000/cap=16 | 718.029438 | 3.266666 | 1489.218369 | 5.424316 | 202,757.0 | 50,270.0 | 14.391 | 10.812 |
+| PendingManyClientCheckpoint/V2/n=10000/cap=10001 | 730.352249 | 3.208812 | 1489.218315 | 5.424316 | 202,756.5 | 50,270.0 | 14.578 | 10.844 |
+| PendingLinearClientQueue/V1/complete=true | 9713.925605 | 9658.783979 | 11780.117760 | 11781.429455 | 1,788,578.0 | 1,788,774.0 | 25.609 | 27.406 |
+| PendingLinearClientQueue/V1/complete=false | 2.818998 | 2.824740 | 5.989239 | 5.263546 | 139,805.0 | 139,784.0 | 11.844 | 11.172 |
+| PendingLinearClientQueue/V2/complete=true | 7.144987 | 7.386854 | 11.178537 | 11.178536 | 140,315.0 | 140,315.0 | 16.047 | 16.094 |
+| PendingLinearClientQueue/V2/complete=false | 2.730879 | 2.725317 | 6.080853 | 5.355153 | 119,844.0 | 119,823.0 | 11.641 | 11.062 |
+| ApplyUpdateV1 | 0.115113 | 0.115133 | 0.217911 | 0.217912 | 3,087.0 | 3,087.0 | 5.250 | 5.219 |
+| ApplyUpdateV1_Bulk | 0.001819 | 0.001819 | 0.003561 | 0.003561 | 37.0 | 37.0 | 5.078 | 5.000 |
+| ApplyUpdateV2 | 0.117203 | 0.115690 | 0.220558 | 0.220555 | 3,114.0 | 3,114.0 | 5.391 | 5.250 |
+| ApplyUpdateV2_Bulk | 0.002772 | 0.002772 | 0.005212 | 0.005212 | 62.0 | 62.0 | 5.266 | 4.859 |
+
+Run the comparison from the PR checkout, preserving the new benchmark fixtures
+on both sides. The overlay restores both production decoding source files to
+exact main; the new helper has no init or runtime caller in the baseline.
+Baseline regression tests are intentionally not run (`-run '^$'`).
+
+```sh
+bench_dir=$(mktemp -d)
+git show 07bd8f62:crdt/update.go > "$bench_dir/main-update.go"
+git show 07bd8f62:crdt/update_v2.go > "$bench_dir/main-update-v2.go"
+python3 - "$bench_dir" <<'PYOVERLAY'
+import json, pathlib, sys
+root = pathlib.Path.cwd()
+data = pathlib.Path(sys.argv[1])
+(data / 'main-overlay.json').write_text(json.dumps({'Replace': {
+    str(root / 'crdt/update.go'): str(data / 'main-update.go'),
+    str(root / 'crdt/update_v2.go'): str(data / 'main-update-v2.go'),
+}}))
+PYOVERLAY
+GOTOOLCHAIN=go1.26.8 go test -overlay="$bench_dir/main-overlay.json" -tags=benchheavy -c ./crdt -o "$bench_dir/main.test"
+GOTOOLCHAIN=go1.26.8 go test -tags=benchheavy -c ./crdt -o "$bench_dir/resolver.test"
+for variant in main resolver; do
+  "$bench_dir/$variant.test" -test.run '^$' -test.bench '^BenchmarkPending(ReverseChain|ManyClientCheckpoint)$' -test.benchmem -test.benchtime=1x -test.count=10 > "$bench_dir/$variant-complete.txt"
+  "$bench_dir/$variant.test" -test.run '^$' -test.bench '^Benchmark(ApplyUpdateV[12](_Bulk)?|PendingLinearClientQueue)$' -test.benchmem -test.benchtime=100ms -test.count=10 > "$bench_dir/$variant-controls.txt"
+done
+benchstat "$bench_dir/main-complete.txt" "$bench_dir/resolver-complete.txt"
+benchstat "$bench_dir/main-controls.txt" "$bench_dir/resolver-controls.txt"
+```
+
+The measured batches alternate variant order per sample; the compact shell
+recipe above runs one batch per side. Raw samples, native RSS logs, frozen
+binaries and full benchstat are saved locally under
+`/tmp/ygo-pr260-review/resolver-pr/`. The fixture generators and regression tests
+are checked into this PR; the temporary artifact path is not a CI dependency.

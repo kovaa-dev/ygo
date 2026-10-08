@@ -782,6 +782,7 @@ func applyV2Txn(txn *Transaction, update []byte) (retErr error) {
 		}
 	}
 
+	// Share the producer-first within-update resolver with V1.
 	if err := resolveWithinUpdatePending(txn, pending); err != nil {
 		return err
 	}

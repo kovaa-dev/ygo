@@ -89,24 +89,27 @@ func (w *pendingGroupWorklist) advance(client ClientID, clock uint64) {
 	}
 }
 
-func resolvePendingGroups(groups []pendingGroup, known StateVector) error {
+func resolvePendingGroups(groups []pendingGroup, known StateVector, resources ...*ProcessingBudget) error {
+	var budget *ProcessingBudget
+	if len(resources) > 0 { budget = resources[0] }
 	w := pendingGroupWorklist{groups: groups, waits: make([]pendingWatch, 2*len(groups)), byClient: make(map[ClientID]*pendingWatchHeap, len(groups)), queue: make([]int, len(groups))}
 	for i := range groups {
-		w.enqueue(i)
+		if !budget.step(1) { return budget.err }		w.enqueue(i)
 	}
 	for w.count > 0 {
-		index := w.queue[w.front]
+		if !budget.step(1) { return budget.err }		index := w.queue[w.front]
 		w.front = (w.front + 1) % len(w.queue)
 		w.count--
 		g := &groups[index]
 		g.queued = false
 		for !g.done {
-			if g.end > known.Clock(g.client) {
+			if !budget.step(1) { return budget.err }			if g.end > known.Clock(g.client) {
 				if client, clock, missing := g.missing(known); missing {
 					w.watch(2*index, client, clock, index)
 					w.watch(2*index+1, g.client, g.end, index)
 					break
 				}
+				if _, exists := known[g.client]; !exists && !budget.allocate(128) { return budget.err }
 				known[g.client] = g.end
 				w.advance(g.client, g.end)
 			}
