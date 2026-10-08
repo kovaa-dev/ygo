@@ -302,8 +302,7 @@ func NewStringDecoder(data []byte) (*StringDecoder, error) {
 		return nil, err
 	}
 	// Remaining bytes are the UintOptRle-encoded lengths.
-	remaining := make([]byte, len(data)-dec.pos)
-	copy(remaining, data[dec.pos:])
+	remaining := dec.RemainingBytesCopy()
 	return &StringDecoder{
 		str:  str,
 		lens: NewUintOptRleDecoder(remaining),

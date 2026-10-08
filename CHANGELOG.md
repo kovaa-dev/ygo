@@ -5,11 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.51.2] — 2026-10-08
+
+### Fixed
+
+- **`crdt`: a struct parked before its root type was first accessed was lost.**
+  When an update for a root (`"t"`) arrived ahead of a dependency, its structs
+  were parked with a placeholder parent; calling `GetText("t")` (or any root
+  accessor) for the first time before the dependency arrived left them pointing
+  at the discarded placeholder, so they never appeared in the type and peers
+  diverged permanently. First access now repoints parked structs too (#290).
+
 ## [1.51.1] — 2026-10-07
 
 ### Fixed
 
-- Resolve dependencies contained in the same complete V1/V2 update before charging its unresolved items to the cross-update pending limit. At that limit, a wire-only dependency preflight rejects oversized incomplete updates before materializing the remaining content. The configured pending limit is unchanged.
+- Resolve dependencies contained in the same complete V1/V2 update before
+  charging unresolved items to the cross-update pending limit. At that limit,
+  preflight scans the wire data once and resolves compact dependency metadata
+  with a worklist, without materializing the remaining content. Rejected
+  preflight updates do not add their deferred items to the persistent pending
+  queue; existing pending items are retained. Already integrated changes are
+  not rolled back. The configured pending limit and public API are unchanged.
 
 - **`crdt`: undo restored a deleted nested type empty.** `ContentType.Copy`
   shared the original type, whose children were all tombstoned, and
@@ -137,10 +154,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   by this version or by yjs. V2 is unaffected.
 - A yjs `undefined` inside `ContentJSON` re-encodes as `null`, as it already
   did for `ContentAny`.
-
-### Added
-
-- `encoding.Decoder.SkipAny` validates and consumes a lib0 Any value without constructing its object tree.
 
 ## [1.51.0] — 2026-10-06
 

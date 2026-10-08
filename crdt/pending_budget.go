@@ -2,17 +2,20 @@ package crdt
 
 import (
 	"bytes"
+	"cmp"
 	"encoding/json"
+	"slices"
 	"strconv"
 	"unicode/utf8"
 
 	"github.com/reearth/ygo/encoding"
+	"github.com/reearth/ygo/internal/anycodec"
 )
 
 // pendingBudget distinguishes a large complete update from a genuinely oversized
 // pending queue before the decoder materializes the rest of its items. The cheap
-// path needs no scan. At the cap, a wire-only dependency pass follows clocks to a
-// fixed point, without constructing items, content values, or shared types.
+// path needs no scan. At the cap, one wire pass and a dependency worklist follow
+// clocks without constructing items, content values, or shared types.
 // References merely being present in the message is insufficient: their own
 // dependencies must be reachable too (including same-client predecessors).
 type pendingBudget struct {
@@ -39,63 +42,178 @@ func (b *pendingBudget) check(count int) error {
 	for client, clock := range b.initial {
 		known[client] = clock
 	}
-	for first := true; ; first = false {
-		s := newPendingScanner(b.update, b.v2)
-		clients := s.uint()
-		if clients > maxV2Items {
+	s := newPendingScanner(b.update, b.v2)
+	clients := s.uint()
+	if clients > maxV2Items {
+		return ErrInvalidUpdate
+	}
+	var nodes []pendingSpan
+	var total uint64
+	for i := uint64(0); i < clients && s.err == nil; i++ {
+		n := s.uint()
+		total += n
+		if total > maxV2Items {
 			return ErrInvalidUpdate
 		}
-		var total uint64
-		pending, progressed := 0, false
-		for i := uint64(0); i < clients && s.err == nil; i++ {
-			n := s.uint()
-			total += n
-			if total > maxV2Items {
+		client, clock := s.client(), s.uint()
+		existingEnd := known.Clock(client)
+		for j := uint64(0); j < n && s.err == nil; j++ {
+			length, skip, deps, numDeps := s.item()
+			end := clock + length
+			if end < clock {
 				return ErrInvalidUpdate
 			}
-			client, clock := s.client(), s.uint()
-			existingEnd := known.Clock(client)
-			if first {
-				existingEnd = b.initial.Clock(client)
-			}
-			for j := uint64(0); j < n && s.err == nil; j++ {
-				length, skip, deps, numDeps := s.item()
-				end := clock + length
-				if end < clock {
-					return ErrInvalidUpdate
-				}
-				// A skip denotes clocks absent from this message. It advances
-				// the wire cursor only and cannot satisfy a dependency.
-				if !skip && end > existingEnd {
-					ready := clock <= existingEnd
-					for _, dep := range deps[:numDeps] {
-						if dep.Clock >= known.Clock(dep.Client) {
-							ready = false
-						}
+			// Skip structs advance only the wire cursor, never known clocks.
+			if !skip && end > existingEnd {
+				ready := clock <= existingEnd
+				for _, dep := range deps[:numDeps] {
+					if dep.Clock >= known.Clock(dep.Client) {
+						ready = false
 					}
-					if ready {
-						existingEnd = end
-						if end > known.Clock(client) {
-							known[client] = end
-							progressed = true
-						}
+				}
+				if ready {
+					known[client] = end
+					existingEnd = end
+				} else {
+					// A long same-client tail blocked on one parent needs one
+					// tuple, not one allocation per item. Equal lengths retain
+					// exact item counts if another group covers only a prefix.
+					if len(nodes) > 0 && nodes[len(nodes)-1].canExtend(client, clock, length, deps, numDeps) {
+						nodes[len(nodes)-1].end = end
+						nodes[len(nodes)-1].count++
 					} else {
-						pending++
+						nodes = append(nodes, pendingSpan{client: client, clock: clock, end: end, length: length, deps: deps, numDeps: numDeps, count: 1})
 					}
 				}
-				clock = end
 			}
+			clock = end
 		}
-		if s.err != nil {
-			return wrapUpdateErr(s.err)
-		}
-		if pending <= b.remaining {
-			b.checked = true
-			return nil
-		}
-		if !progressed {
+	}
+	if s.err != nil {
+		return wrapUpdateErr(s.err)
+	}
+	if pendingSpanCount(nodes, known) > b.remaining {
+		resolvePendingSpans(nodes, known)
+		if pendingSpanCount(nodes, known) > b.remaining {
 			return ErrInvalidUpdate
 		}
+	}
+	b.checked = true
+	return nil
+}
+
+// pendingSpan contains only dependency metadata. Consecutive equal-length items
+// with identical dependencies share a tuple; no CRDT content is retained.
+type pendingSpan struct {
+	client             ClientID
+	clock, end, length uint64
+	deps               [3]ID
+	numDeps, count     int
+	waiting            int
+	queued, done       bool
+}
+
+func (n *pendingSpan) canExtend(client ClientID, clock, length uint64, deps [3]ID, numDeps int) bool {
+	return n.length > 0 && n.client == client && n.end == clock &&
+		n.length == length && n.numDeps == numDeps && n.deps == deps
+}
+
+// pendingSpanCount counts wire structs beyond each contiguous known frontier.
+func pendingSpanCount(nodes []pendingSpan, known StateVector) int {
+	count := 0
+	for _, n := range nodes {
+		clock := known.Clock(n.client)
+		if clock >= n.end {
+			continue
+		}
+		remaining := n.count
+		if clock > n.clock && n.length > 0 {
+			remaining -= int((clock - n.clock) / n.length)
+		}
+		count += remaining
+	}
+	return count
+}
+
+// Each dependency is registered once and consumed once when its client's clock
+// advances. Sorting waiters replaces repeated full-wire scans; queued tuples are
+// processed at most once, even when another client group covers their range.
+func resolvePendingSpans(nodes []pendingSpan, known StateVector) {
+	type waiter struct {
+		client ClientID
+		clock  uint64 // required next clock, inclusive
+		node   int
+		covers bool
+	}
+	var waits []waiter
+	queue := make([]int, 0, len(nodes))
+	for i := range nodes {
+		n := &nodes[i]
+		if known.Clock(n.client) >= n.end {
+			n.done = true
+			continue
+		}
+		// Coverage can make a duplicate/overlapping tuple irrelevant even
+		// while its explicit dependencies are still missing.
+		waits = append(waits, waiter{client: n.client, clock: n.end, node: i, covers: true})
+		if n.clock > known.Clock(n.client) {
+			waits = append(waits, waiter{client: n.client, clock: n.clock, node: i})
+			n.waiting++
+		}
+		for _, dep := range n.deps[:n.numDeps] {
+			if dep.Clock >= known.Clock(dep.Client) {
+				waits = append(waits, waiter{client: dep.Client, clock: dep.Clock + 1, node: i})
+				n.waiting++
+			}
+		}
+		if n.waiting == 0 {
+			n.queued = true
+			queue = append(queue, i)
+		}
+	}
+	slices.SortFunc(waits, func(a, b waiter) int {
+		if a.client != b.client {
+			return cmp.Compare(a.client, b.client)
+		}
+		return cmp.Compare(a.clock, b.clock)
+	})
+	type interval struct{ next, end int }
+	byClient := make(map[ClientID]interval)
+	for i := 0; i < len(waits); {
+		end := i + 1
+		for end < len(waits) && waits[end].client == waits[i].client {
+			end++
+		}
+		byClient[waits[i].client] = interval{next: i, end: end}
+		i = end
+	}
+	for head := 0; head < len(queue); head++ {
+		n := &nodes[queue[head]]
+		if n.done {
+			continue
+		}
+		n.done = true
+		if known.Clock(n.client) >= n.end {
+			continue
+		}
+		known[n.client] = n.end
+		window := byClient[n.client]
+		for window.next < window.end && waits[window.next].clock <= n.end {
+			w := waits[window.next]
+			window.next++
+			target := &nodes[w.node]
+			if target.done || target.queued {
+				continue
+			}
+			if !w.covers {
+				target.waiting--
+			}
+			if w.covers || target.waiting == 0 {
+				target.queued = true
+				queue = append(queue, w.node)
+			}
+		}
+		byClient[n.client] = window
 	}
 }
 
@@ -182,9 +300,15 @@ func (s *pendingScanner) bytes() {
 }
 func (s *pendingScanner) any() {
 	if s.err == nil {
-		s.err = s.rest.SkipAny()
+		rest := s.rest.RemainingBytes()
+		consumed, err := anycodec.Skip(rest)
+		// Keep the existing pointer (also v2.restDec), resetting its buffer to
+		// the unread suffix. This advances without re-reading every skipped byte.
+		*s.rest = *encoding.NewDecoder(rest[consumed:])
+		s.err = err
 	}
 }
+
 func (s *pendingScanner) text() uint64 {
 	if s.err != nil {
 		return 0

@@ -4,6 +4,8 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/reearth/ygo/internal/anycodec"
 )
 
 func TestUnit_SkipAny_ConsumesAndValidatesLikeReadAny(t *testing.T) {
@@ -14,14 +16,14 @@ func TestUnit_SkipAny_ConsumesAndValidatesLikeReadAny(t *testing.T) {
 		enc.WriteUint8(42)
 		data := enc.Bytes()
 		for length := 0; length <= len(data); length++ {
-			a, b := NewDecoder(data[:length]), NewDecoder(data[:length])
+			a := NewDecoder(data[:length])
 			_, want := a.ReadAny()
-			err := b.SkipAny()
+			consumed, err := anycodec.Skip(data[:length])
 			require.Equal(t, want, err)
-			require.Equal(t, a.Remaining(), b.Remaining())
+			require.Equal(t, a.Remaining(), length-consumed)
 		}
 		var err error
-		allocs := testing.AllocsPerRun(1, func() { err = NewDecoder(data).SkipAny() })
+		allocs := testing.AllocsPerRun(1, func() { _, err = anycodec.Skip(data) })
 		require.NoError(t, err)
 		require.Zero(t, allocs, "skip must not materialize nested values")
 	}
@@ -32,7 +34,8 @@ func TestUnit_SkipAny_ConsumesAndValidatesLikeReadAny(t *testing.T) {
 	} {
 		_, want := NewDecoder(data).ReadAny()
 		require.Error(t, want)
-		require.Equal(t, want, NewDecoder(data).SkipAny())
+		_, err := anycodec.Skip(data)
+		require.Equal(t, want, err)
 	}
 	enc := NewEncoder()
 	for i := 0; i < maxAnyDepth+2; i++ {
@@ -40,9 +43,11 @@ func TestUnit_SkipAny_ConsumesAndValidatesLikeReadAny(t *testing.T) {
 		enc.WriteVarUint(1)
 	}
 	enc.WriteUint8(126)
-	require.ErrorIs(t, NewDecoder(enc.Bytes()).SkipAny(), ErrDepthExceeded)
+	_, err := anycodec.Skip(enc.Bytes())
+	require.ErrorIs(t, err, ErrDepthExceeded)
 	enc = NewEncoder()
 	enc.WriteUint8(117)
 	enc.WriteVarUint(maxAnyElements + 1)
-	require.ErrorIs(t, NewDecoder(enc.Bytes()).SkipAny(), ErrDepthExceeded)
+	_, err = anycodec.Skip(enc.Bytes())
+	require.ErrorIs(t, err, ErrDepthExceeded)
 }

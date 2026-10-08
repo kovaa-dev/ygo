@@ -1,6 +1,26 @@
+## v1.51.2
+
+**Who is affected:** servers and clients that call `GetText`, `GetArray`,
+`GetMap` or `GetXmlFragment` only after applying updates, for example after a
+sync step.
+
+**Edits that arrived out of order could vanish.** If an update for a document
+root arrived before an edit it depends on, and the code then accessed that root
+for the first time before the missing edit arrived, the waiting update was
+attached to a placeholder and never showed up. That peer stayed different from
+everyone else for good. Accessing a root now picks up waiting updates too.
+
+**Upgrading.** No API change.
+
 ## v1.51.1
 
-Resolve dependencies contained in the same complete V1/V2 update before charging its unresolved items to the cross-update pending limit. At that limit, a wire-only dependency preflight rejects oversized incomplete updates before materializing the remaining content. The configured pending limit is unchanged. This release also adds `encoding.Decoder.SkipAny`; it uses the same validation and depth/element limits as `ReadAny`.
+Complete V1/V2 checkpoints resolve dependencies within the update before the
+cross-update pending limit is applied. At that limit, preflight reads the wire
+data once and processes a worklist of compact dependency metadata, without
+constructing the remaining content values. A rejected preflight update leaves
+none of its deferred items in the persistent pending queue; items queued by
+previous updates remain. This is not a rollback of changes already integrated
+before the rejection. The pending limit, wire format and public API are unchanged.
 
 **Who is affected:** anyone using `UndoManager` or `YArray.Move`, and anyone
 exchanging V1 updates with yjs peers that carry legacy JSON content.

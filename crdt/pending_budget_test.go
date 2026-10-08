@@ -2,6 +2,7 @@ package crdt
 
 import (
 	"fmt"
+	"math/rand"
 	"strings"
 	"testing"
 
@@ -73,7 +74,7 @@ func TestUnit_PendingBudget_BoundsIncompleteAllocations(t *testing.T) {
 						doc.Destroy()
 					})
 					require.ErrorIs(t, applyErr, ErrInvalidUpdate)
-					require.LessOrEqual(t, pending, 16)
+					require.Zero(t, pending, "preflight rejection must not park new items")
 					counts = append(counts, count)
 				}
 				// A 200x larger blocked tail must not materialize 200x more
@@ -212,5 +213,185 @@ func TestUnit_PendingScanner_ContentJSONV1MatchesDecoder(t *testing.T) {
 				require.Equal(t, dec.RemainingBytes(), s.rest.RemainingBytes())
 			}
 		})
+	}
+}
+
+// A skipped clock is absent, even when real structs exist on both sides of it.
+// Neither the skipped interval nor a dependent item can make its clocks known.
+func TestUnit_PendingBudget_SkipsDoNotSatisfyDependencies(t *testing.T) {
+	for _, version := range []int{1, 2} {
+		t.Run(fmt.Sprint(version), func(t *testing.T) {
+			source := New()
+			defer source.Destroy()
+			text := source.GetText("text")
+			groups := map[ClientID][]*Item{
+				1: {{ID: ID{Client: 1}, Content: NewContentDeleted(1)}, {ID: ID{Client: 1, Clock: 3}, Content: NewContentDeleted(1)}},
+				2: {{ID: ID{Client: 2}, Origin: &ID{Client: 1, Clock: 2}, Parent: &text.abstractType, Content: NewContentString("a")}},
+				3: {{ID: ID{Client: 3}, Origin: &ID{Client: 1, Clock: 2}, Parent: &text.abstractType, Content: NewContentString("b")}},
+			}
+			encode, apply := encodeStructStoreV1, ApplyUpdateV1
+			if version == 2 {
+				encode, apply = encodeStructStoreV2, ApplyUpdateV2
+			}
+			update := encode(groups, newDeleteSet(), nil, source.store)
+			target := New(WithMaxPendingItems(1))
+			defer target.Destroy()
+			budget := newPendingBudget(target, target.StateVector(), update, version == 2)
+			require.ErrorIs(t, budget.check(1), ErrInvalidUpdate)
+			require.False(t, budget.checked)
+			require.ErrorIs(t, apply(target, update, nil), ErrInvalidUpdate)
+			require.Zero(t, target.PendingStats().Items, "rejection must not park the update's deferred items")
+		})
+	}
+}
+
+func TestUnit_PendingBudget_ReverseChainCompletes(t *testing.T) {
+	for _, version := range []int{1, 2} {
+		t.Run(fmt.Sprint(version), func(t *testing.T) {
+			doc := New(WithMaxPendingItems(1))
+			defer doc.Destroy()
+			apply := ApplyUpdateV1
+			if version == 2 {
+				apply = ApplyUpdateV2
+			}
+			const n = 32
+			require.NoError(t, apply(doc, pendingReverseChain(version, n), nil))
+			require.Equal(t, strings.Repeat("x", n), doc.GetText("text").ToString())
+			require.Len(t, doc.StateVector(), n)
+			require.Zero(t, doc.PendingStats().Items)
+		})
+	}
+}
+
+// The reference scanner protects the prior fixed-point acceptance decision,
+// independently of the new waiter ordering and span compaction.
+func TestUnit_PendingBudget_WorklistMatchesFixedPoint(t *testing.T) {
+	rng := rand.New(rand.NewSource(260))
+	source := New()
+	defer source.Destroy()
+	text := source.GetText("text")
+	for scenario := 0; scenario < 200; scenario++ {
+		groups := make(map[ClientID][]*Item)
+		initial := make(StateVector)
+		for c := 1; c <= 8; c++ {
+			client := ClientID(c)
+			initial[client] = uint64(rng.Intn(5))
+			clock := uint64(rng.Intn(3))
+			for j, n := 0, 1+rng.Intn(5); j < n; j++ {
+				content := NewContentString(strings.Repeat("x", 1+rng.Intn(3)))
+				item := &Item{ID: ID{Client: client, Clock: clock}, Parent: &text.abstractType, Content: content}
+				if rng.Intn(2) == 0 {
+					item.Origin = &ID{Client: ClientID(1 + rng.Intn(10)), Clock: uint64(rng.Intn(12))}
+				}
+				if rng.Intn(3) == 0 {
+					item.OriginRight = &ID{Client: ClientID(1 + rng.Intn(10)), Clock: uint64(rng.Intn(12))}
+				}
+				groups[client] = append(groups[client], item)
+				clock += uint64(content.Len() + rng.Intn(3))
+			}
+		}
+		for _, version := range []int{1, 2} {
+			encode := encodeStructStoreV1
+			if version == 2 {
+				encode = encodeStructStoreV2
+			}
+			update := encode(groups, newDeleteSet(), nil, source.store)
+			for _, cap := range []int{0, 1, 4, 100} {
+				budget := pendingBudget{initial: initial, update: update, remaining: cap, v2: version == 2}
+				want := referencePendingBudgetCheck(budget, cap)
+				got := budget.check(cap)
+				require.Equal(t, want == nil, got == nil, "scenario=%d V%d cap=%d: reference=%v worklist=%v", scenario, version, cap, want, got)
+			}
+		}
+	}
+}
+
+func referencePendingBudgetCheck(b pendingBudget, count int) error {
+	if b.checked || count < b.remaining {
+		return nil
+	}
+	known := make(StateVector, len(b.initial))
+	for client, clock := range b.initial {
+		known[client] = clock
+	}
+	for first := true; ; first = false {
+		s := newPendingScanner(b.update, b.v2)
+		clients := s.uint()
+		if clients > maxV2Items {
+			return ErrInvalidUpdate
+		}
+		var total uint64
+		pending, progressed := 0, false
+		for i := uint64(0); i < clients && s.err == nil; i++ {
+			n := s.uint()
+			total += n
+			if total > maxV2Items {
+				return ErrInvalidUpdate
+			}
+			client, clock := s.client(), s.uint()
+			existingEnd := known.Clock(client)
+			if first {
+				existingEnd = b.initial.Clock(client)
+			}
+			for j := uint64(0); j < n && s.err == nil; j++ {
+				length, skip, deps, numDeps := s.item()
+				end := clock + length
+				if end < clock {
+					return ErrInvalidUpdate
+				}
+				// A skip denotes clocks absent from this message. It advances
+				// the wire cursor only and cannot satisfy a dependency.
+				if !skip && end > existingEnd {
+					ready := clock <= existingEnd
+					for _, dep := range deps[:numDeps] {
+						if dep.Clock >= known.Clock(dep.Client) {
+							ready = false
+						}
+					}
+					if ready {
+						existingEnd = end
+						if end > known.Clock(client) {
+							known[client] = end
+							progressed = true
+						}
+					} else {
+						pending++
+					}
+				}
+				clock = end
+			}
+		}
+		if s.err != nil {
+			return wrapUpdateErr(s.err)
+		}
+		if pending <= b.remaining {
+			b.checked = true
+			return nil
+		}
+		if !progressed {
+			return ErrInvalidUpdate
+		}
+	}
+}
+
+// The scanner shares V2's rest cursor. Advancing Any must retain that cursor
+// and match the public decoder's error position, including truncated values.
+func TestUnit_PendingScanner_AnyCursor(t *testing.T) {
+	values := []any{nil, true, int64(123456), float64(1.25), encoding.BigInt(55), "Ключ 🐷", []byte{1, 2}, []any{1, "s", map[string]any{"nested": []any{true, nil}}}}
+	for _, value := range values {
+		enc := encoding.NewEncoder()
+		enc.WriteAny(value)
+		enc.WriteUint8(42)
+		data := enc.Bytes()
+		for length := 0; length <= len(data); length++ {
+			expected := encoding.NewDecoder(data[:length])
+			_, wantErr := expected.ReadAny()
+			s := &pendingScanner{rest: encoding.NewDecoder(data[:length])}
+			s.v2 = &v2Decoder{restDec: s.rest}
+			s.any()
+			require.Equal(t, wantErr, s.err)
+			require.Equal(t, expected.RemainingBytes(), s.rest.RemainingBytes())
+			require.Same(t, s.rest, s.v2.restDec, "V2 must observe the advanced rest cursor")
+		}
 	}
 }
