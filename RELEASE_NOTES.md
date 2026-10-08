@@ -1,3 +1,15 @@
+## v1.51.3
+
+Complete V1/V2 checkpoints resolve dependencies within the update before the
+cross-update pending limit is applied. Preflight retains the current blocked
+struct and a resumable decoder cursor per wire group, rather than metadata for
+every struct in a blocked tail. V2 cursors share immutable columns and the
+string pool. Single-group updates stop once the number of permanently blocked
+structs exceeds the remaining budget. A rejected preflight update adds none of
+its deferred items to the persistent pending queue; previously queued items
+remain. Changes already integrated before rejection are not rolled back.
+The configured pending limit, wire format and public API are unchanged.
+
 ## v1.51.2
 
 **Who is affected:** servers and clients that call `GetText`, `GetArray`,

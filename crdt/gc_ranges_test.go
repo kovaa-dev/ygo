@@ -1,6 +1,7 @@
 package crdt
 
 import (
+	"fmt"
 	"math/rand"
 	"strings"
 	"testing"

@@ -714,12 +714,12 @@ func decodeAndPark(txn *Transaction, dec *encoding.Decoder, sv StateVector, numC
 	return pending, nil
 }
 
-// resolveWithinUpdatePending takes the items deferred during decoding
-// (those whose parent might resolve via later items in the same update)
-// and runs a fixed-point loop: try to integrate each item by resolving its
-// parent from the store. If progress was made, try again with the remaining
-// items. When no progress is made, partition survivors into future-clock
-// (park in store.pending) vs truly-unresolvable (orphan-Append).
+// resolveWithinUpdatePending retries items deferred during decoding until
+// no more dependencies resolve. tryIntegrate also stores genuine GC orphans
+// without attaching them to a root, and respects same-client clock gaps.
+// Survivors are parked in store.pending within the cross-update limit.
+// Preflight bounds unresolved items before decoding an oversized blocked tail;
+// this integration loop still uses the existing fixed-point traversal.
 // Returns ErrInvalidUpdate (wrapped) if the pending queue cap is exceeded.
 func resolveWithinUpdatePending(txn *Transaction, pending []*Item) error {
 	for len(pending) > 0 {

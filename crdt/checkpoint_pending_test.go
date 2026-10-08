@@ -42,7 +42,7 @@ func TestUnit_Checkpoint_ResolvesSameUpdateBeforePendingLimit(t *testing.T) {
 					err = ApplyUpdateV2(missing, EncodeStateAsUpdateV2(writer, parent.StateVector()), nil)
 				}
 				require.ErrorIs(t, err, ErrInvalidUpdate)
-				require.LessOrEqual(t, missing.PendingStats().Items, 3)
+				require.Zero(t, missing.PendingStats().Items, "preflight rejection must not park new items")
 			})
 		}
 	}
