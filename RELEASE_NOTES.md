@@ -1,6 +1,72 @@
-## Pending release
+## v1.51.1
 
 Avoid scanning unrelated map keys when a replacement is placed immediately after the previous rightmost value of that key. Concurrent replacements still use the existing conflict resolution path.
+
+**Who is affected:** anyone using `UndoManager` or `YArray.Move`, and anyone
+exchanging V1 updates with yjs peers that carry legacy JSON content.
+
+**Undo no longer touches other people's edits.** Undo groups edits made close
+together into one step. That step used to cover every change in its time
+span, including a collaborator's insert that arrived in between, so pressing
+undo could delete their work. It could also overwrite a map entry a
+collaborator had changed since. Undo now tracks exactly which edits it
+recorded, as yjs does, and leaves everything else alone. Every transaction
+also claimed to be local, so a default `UndoManager` recorded remote updates
+as your own; `Transaction.Local` is now `false` for applied updates.
+
+**Undo restores nested content.** Deleting an entry that held a nested text,
+map or array and pressing undo brought it back empty. It now comes back with
+its contents. Edits inside nested types are now recorded for undo too, and
+undoing two quick edits on a fresh document no longer leaves the first behind.
+
+**`YArray.Get` no longer panics after undo, redo or a move.** Reads could
+crash with an index out of range, or return the wrong element. Undoing a move
+could also make the element disappear from reads while still counting in
+`Len`.
+
+**V1 legacy JSON content is readable both ways.** Older yjs content stored as
+JSON failed to decode in the V1 format, in either direction. It now matches
+yjs, and data an older ygo stored in its previous format still loads.
+
+**Staging a type into itself panics instead of crashing later.**
+
+**`YArray.Move` fixes.** Moving an element you already moved now takes effect,
+undoing the delete of a moved element puts it back where you moved it, and
+array change events now report undone moves, so an editor bound to the events
+stays in step.
+
+**`RunGC` no longer makes maps diverge.** Garbage collection could merge
+deleted entries belonging to different keys, after which peers disagreed on a
+key's value.
+
+**A map write could vanish on other peers.** Setting a key whose previous
+value arrived from yjs as a merged run could keep the new value locally while
+every other peer dropped it. Copying text with `ApplyDelta` also lost embeds;
+both now behave as in yjs.
+
+**Undo matches yjs more closely**, including which value wins when two
+collaborators' restored values compete for one key.
+
+**XML and JSON edge cases.** An XML node can no longer be put into two parents
+at once, legacy JSON attributes read correctly, and Go values that JSON cannot
+represent (functions, channels) are rejected instead of silently replacing the
+whole value with `null`.
+
+**Upgrading.** No API change, but check these behaviour changes:
+
+- Observers reading `Transaction.Local` now see `false` for remote changes.
+- `Undo`/`Redo` skip steps that would no longer change anything, so one call
+  may undo an older step, and they return `false` when nothing changed.
+- Something inserted and deleted within one undo step stays deleted on undo.
+  Call `StopCapturing` between the two if you want separate steps.
+- XML `Insert` panics on a node that is already attached or staged elsewhere
+  (including a child of a detached node you never attached: delete it from that
+  node first), and text inserts panic on functions, channels or shared types
+  passed as values. Both used to be
+  accepted and corrupted the document.
+- **Rolling upgrades:** ygo 1.51.0 and older cannot read V1 updates carrying
+  legacy JSON content written by this version. Upgrade all nodes before
+  relaying such documents in V1, or use V2.
 
 ## v1.51.0
 
