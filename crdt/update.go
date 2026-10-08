@@ -1,9 +1,11 @@
 package crdt
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 
 	"github.com/reearth/ygo/encoding"
@@ -48,6 +50,7 @@ func EncodeStateAsUpdateV1(doc *Doc, sv StateVector) []byte {
 func ApplyUpdateV1(doc *Doc, update []byte, origin any) error {
 	var applyErr error
 	doc.Transact(func(txn *Transaction) {
+		txn.Local = false // Yjs readUpdate: transact(..., local=false)
 		applyErr = applyV1Txn(txn, update)
 	}, origin)
 	return applyErr
@@ -95,6 +98,7 @@ func withParked(doc *Doc, sv StateVector, state []byte,
 func ApplyUpdateV2(doc *Doc, update []byte, origin any) error {
 	var applyErr error
 	doc.Transact(func(txn *Transaction) {
+		txn.Local = false // Yjs readUpdate: transact(..., local=false)
 		applyErr = applyV2Txn(txn, update)
 	}, origin)
 	return applyErr
@@ -374,7 +378,8 @@ func encodeContent(enc *encoding.Encoder, c Content, offset int) {
 		vals := ct.Vals[offset:]
 		enc.WriteVarUint(uint64(len(vals)))
 		for _, v := range vals {
-			enc.WriteAny(v)
+			// Yjs writes JSON text per value in V1 too, not lib0 Any.
+			enc.WriteVarString(fmtValToJSON(v))
 		}
 	case *ContentBinary:
 		enc.WriteVarBytes(ct.Data)
@@ -1047,11 +1052,28 @@ func decodeContent(dec *encoding.Decoder, doc *Doc, tag byte) (Content, error) {
 		if n > uint64(dec.Remaining()) {
 			return nil, ErrInvalidUpdate
 		}
-		vals := make([]any, n)
-		for i := range vals {
-			if vals[i], err = dec.ReadAny(); err != nil {
+		if n == 0 || !isAnyTag(dec.RemainingBytes()[0]) {
+			vals, err := readJSONVals(dec, n)
+			if err != nil {
 				return nil, err
 			}
+			return NewContentJSON(vals...), nil
+		}
+		// ygo ≤1.51.0 wrote lib0 Any per value, always starting with a tag
+		// 116–127, as does a 116–127-byte JSON text. One encoder writes the
+		// whole item, so try JSON text for all values, else Any for all.
+		// JSON text (Yjs) wins input valid both ways.
+		rem := dec.RemainingBytes()
+		sub := encoding.NewDecoder(rem)
+		vals, jsonErr := readJSONVals(sub, n)
+		if jsonErr == nil {
+			for range len(rem) - sub.Remaining() {
+				_, _ = dec.ReadUint8()
+			}
+			return NewContentJSON(vals...), nil
+		}
+		if vals, err = readLegacyAnyVals(dec, n); err != nil {
+			return nil, jsonErr
 		}
 		return NewContentJSON(vals...), nil
 
@@ -1282,22 +1304,65 @@ func wrapUpdateErr(err error) error {
 	return fmt.Errorf("%w: %v", ErrInvalidUpdate, err)
 }
 
-// fmtValToJSON serialises a ContentFormat attribute value as a JSON string,
-// matching Yjs's ContentFormat.write() which calls encoder.writeJSON(value).
+// fmtValToJSON serialises a ContentFormat/ContentEmbed/ContentJSON value as
+// JSON text, matching Yjs's JSON.stringify. HTML escaping is off because
+// JSON.stringify never escapes <, > or &.
+//
+// A non-finite number is written as null, as JSON.stringify does; any other
+// unencodable value (one that bypassed checkTextValue) panics, as WriteAny does.
 func fmtValToJSON(v any) string {
 	if v == nil {
 		return "null"
 	}
-	b, err := json.Marshal(v)
+	s, err := encodeJSONText(v)
 	if err != nil {
-		return "null"
+		if s, err = encodeJSONText(nullNonFinite(v)); err != nil {
+			panic("crdt: value is not JSON-encodable: " + err.Error())
+		}
 	}
-	return string(b)
+	return s
 }
 
-// fmtValFromJSON deserialises a ContentFormat attribute value from a JSON
-// string, matching Yjs's ContentFormat.read() which calls decoder.readJSON().
-// Numbers decode as float64, booleans as bool, null as nil.
+func encodeJSONText(v any) (string, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		return "", err
+	}
+	return string(bytes.TrimSuffix(buf.Bytes(), []byte("\n"))), nil
+}
+
+// nullNonFinite returns v with every NaN/±Inf replaced by nil.
+func nullNonFinite(v any) any {
+	switch t := v.(type) {
+	case float64:
+		if math.IsNaN(t) || math.IsInf(t, 0) {
+			return nil
+		}
+	case float32:
+		if f := float64(t); math.IsNaN(f) || math.IsInf(f, 0) {
+			return nil
+		}
+	case []any:
+		out := make([]any, len(t))
+		for i, e := range t {
+			out[i] = nullNonFinite(e)
+		}
+		return out
+	case map[string]any:
+		out := make(map[string]any, len(t))
+		for k, e := range t {
+			out[k] = nullNonFinite(e)
+		}
+		return out
+	}
+	return v
+}
+
+// fmtValFromJSON parses JSON text written by fmtValToJSON or Yjs's
+// JSON.stringify, with Yjs's 'undefined' marker as nil. Numbers decode as
+// float64, booleans as bool, null as nil.
 func fmtValFromJSON(s string) (any, error) {
 	if s == "undefined" {
 		return nil, nil
@@ -1307,6 +1372,57 @@ func fmtValFromJSON(s string) (any, error) {
 		return nil, err
 	}
 	return v, nil
+}
+
+// isAnyTag reports whether b is a lib0 Any type tag.
+func isAnyTag(b byte) bool { return b >= 116 && b <= 127 }
+
+// readJSONVals reads n ContentJSON values in Yjs's JSON-text form.
+func readJSONVals(dec *encoding.Decoder, n uint64) ([]any, error) {
+	vals := make([]any, n)
+	for i := range vals {
+		js, err := dec.ReadVarString()
+		if err != nil {
+			return nil, err
+		}
+		if vals[i], err = fmtValFromJSON(js); err != nil {
+			return nil, err
+		}
+	}
+	return vals, nil
+}
+
+// readLegacyAnyVals reads n ContentJSON values in ygo ≤1.51.0's lib0 Any
+// form, with numbers widened to float64 as the JSON form decodes them.
+func readLegacyAnyVals(dec *encoding.Decoder, n uint64) ([]any, error) {
+	vals := make([]any, n)
+	for i := range vals {
+		v, err := dec.ReadAny()
+		if err != nil {
+			return nil, err
+		}
+		vals[i] = jsonNumbers(v)
+	}
+	return vals, nil
+}
+
+// jsonNumbers widens lib0 Any's float32 and int64 to float64, recursively.
+func jsonNumbers(v any) any {
+	switch x := v.(type) {
+	case float32:
+		return float64(x)
+	case int64:
+		return float64(x)
+	case []any:
+		for i := range x {
+			x[i] = jsonNumbers(x[i])
+		}
+	case map[string]any:
+		for k := range x {
+			x[k] = jsonNumbers(x[k])
+		}
+	}
+	return v
 }
 
 // tryIntegrate attempts to integrate item into the doc store. Returns
