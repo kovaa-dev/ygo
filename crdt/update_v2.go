@@ -6,6 +6,7 @@ import (
 	"sort"
 
 	"github.com/reearth/ygo/encoding"
+	"github.com/reearth/ygo/internal/anycodec"
 )
 
 // maxV2Items caps the total number of structs decoded from a single V2 update to
@@ -126,15 +127,15 @@ func (e *v2Encoder) writeDsLen(l uint64) {
 // ── V2 decoder state ──────────────────────────────────────────────────────────
 
 type v2Decoder struct {
-	keyClockDec   *encoding.IntDiffOptRleDecoder
-	clientDec     *encoding.UintOptRleDecoder
-	leftClockDec  *encoding.IntDiffOptRleDecoder
-	rightClockDec *encoding.IntDiffOptRleDecoder
-	infoDec       *encoding.RleByteDecoder
-	stringDec     *encoding.StringDecoder
-	parentInfoDec *encoding.RleByteDecoder
-	typeRefDec    *encoding.UintOptRleDecoder
-	lenDec        *encoding.UintOptRleDecoder
+	keyClockDec   anycodec.IntDiffOptRleDecoder
+	clientDec     anycodec.UintOptRleDecoder
+	leftClockDec  anycodec.IntDiffOptRleDecoder
+	rightClockDec anycodec.IntDiffOptRleDecoder
+	infoDec       anycodec.RleByteDecoder
+	stringDec     anycodec.StringDecoder
+	parentInfoDec anycodec.RleByteDecoder
+	typeRefDec    anycodec.UintOptRleDecoder
+	lenDec        anycodec.UintOptRleDecoder
 	restDec       *encoding.Decoder
 
 	keys      []string
@@ -199,21 +200,21 @@ func newV2Decoder(data []byte) (*v2Decoder, error) {
 	// Remaining bytes = restDecoder (raw, no length prefix)
 	remaining := dec.RemainingBytes()
 
-	stringDec, err := encoding.NewStringDecoder(stringBytes)
+	stringDec, err := anycodec.NewStringDecoder(stringBytes)
 	if err != nil {
 		return nil, fmt.Errorf("%w: V2 stringDecoder: %v", ErrInvalidUpdate, err)
 	}
 
 	return &v2Decoder{
-		keyClockDec:   encoding.NewIntDiffOptRleDecoder(keyClockBytes),
-		clientDec:     encoding.NewUintOptRleDecoder(clientBytes),
-		leftClockDec:  encoding.NewIntDiffOptRleDecoder(leftClockBytes),
-		rightClockDec: encoding.NewIntDiffOptRleDecoder(rightClockBytes),
-		infoDec:       encoding.NewRleByteDecoder(infoBytes),
+		keyClockDec:   anycodec.NewIntDiffOptRleDecoder(keyClockBytes),
+		clientDec:     anycodec.NewUintOptRleDecoder(clientBytes),
+		leftClockDec:  anycodec.NewIntDiffOptRleDecoder(leftClockBytes),
+		rightClockDec: anycodec.NewIntDiffOptRleDecoder(rightClockBytes),
+		infoDec:       anycodec.NewRleByteDecoder(infoBytes),
 		stringDec:     stringDec,
-		parentInfoDec: encoding.NewRleByteDecoder(parentInfoBytes),
-		typeRefDec:    encoding.NewUintOptRleDecoder(typeRefBytes),
-		lenDec:        encoding.NewUintOptRleDecoder(lenBytes),
+		parentInfoDec: anycodec.NewRleByteDecoder(parentInfoBytes),
+		typeRefDec:    anycodec.NewUintOptRleDecoder(typeRefBytes),
+		lenDec:        anycodec.NewUintOptRleDecoder(lenBytes),
 		restDec:       encoding.NewDecoder(remaining),
 	}, nil
 }
@@ -596,6 +597,10 @@ func applyV2Txn(txn *Transaction, update []byte) (retErr error) {
 	}
 
 	sv := txn.doc.store.StateVector()
+	initialV2 := *dec
+	budget := newPendingBudget(txn.doc, sv, update, true)
+	budget.v2Start = &initialV2
+	budget.v2Rest = *dec.restDec
 
 	numClients, err := dec.restDec.ReadVarUint()
 	if err != nil {
@@ -608,7 +613,6 @@ func applyV2Txn(txn *Transaction, update []byte) (retErr error) {
 	}
 
 	var pending []*Item
-	budget := newPendingBudget(txn.doc, sv, update, true)
 
 	totalStructs := uint64(0)
 	for i := uint64(0); i < numClients; i++ {

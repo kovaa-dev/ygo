@@ -1,4 +1,4 @@
-// Package anycodec provides the shared lib0 cursor and Any traversal used by
+// Package anycodec provides shared lib0 primitive, RLE and Any cursors used by
 // encoding and the CRDT wire-only preflight.
 package anycodec
 

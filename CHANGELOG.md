@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.51.3] — 2026-10-08
+
+### Fixed
+
+- Resolve dependencies in complete V1/V2 checkpoints before applying the
+  cross-update pending limit. Preflight retains one blocked head and a decoder
+  cursor per wire group, preventing large per-struct metadata allocations on
+  incomplete updates. V2 cursors share immutable column data; single-group
+  updates reject oversized blocked tails early. Rejected preflight updates
+  add no deferred items to the persistent pending queue, retain previously
+  queued items, and do not roll back changes already integrated. The pending
+  limit, wire format and public API are unchanged.
+
 ## [1.51.2] — 2026-10-08
 
 ### Fixed
@@ -19,14 +32,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [1.51.1] — 2026-10-07
 
 ### Fixed
-
-- Resolve dependencies contained in the same complete V1/V2 update before
-  charging unresolved items to the cross-update pending limit. At that limit,
-  preflight scans the wire data once and resolves compact dependency metadata
-  with a worklist, without materializing the remaining content. Rejected
-  preflight updates do not add their deferred items to the persistent pending
-  queue; existing pending items are retained. Already integrated changes are
-  not rolled back. The configured pending limit and public API are unchanged.
 
 - **`crdt`: undo restored a deleted nested type empty.** `ContentType.Copy`
   shared the original type, whose children were all tombstoned, and

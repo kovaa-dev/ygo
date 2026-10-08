@@ -264,8 +264,8 @@ func TestUnit_PendingBudget_ReverseChainCompletes(t *testing.T) {
 }
 
 // The reference scanner protects the prior fixed-point acceptance decision,
-// independently of the new waiter ordering and span compaction.
-func TestUnit_PendingBudget_WorklistMatchesFixedPoint(t *testing.T) {
+// independently of bounded passes, group cursors and wakeup ordering.
+func TestUnit_PendingBudget_GroupHeadsMatchFixedPoint(t *testing.T) {
 	rng := rand.New(rand.NewSource(260))
 	source := New()
 	defer source.Destroy()
@@ -394,4 +394,28 @@ func TestUnit_PendingScanner_AnyCursor(t *testing.T) {
 			require.Same(t, s.rest, s.v2.restDec, "V2 must observe the advanced rest cursor")
 		}
 	}
+}
+
+// pendingReverseChain puts each origin in the next wire client group. Each
+// client has one item; only the last group can integrate on the first pass.
+func pendingReverseChain(version, n int) []byte {
+	doc := New()
+	defer doc.Destroy()
+	text := doc.GetText("text")
+	groups := make(map[ClientID][]*Item, n)
+	for i := 1; i <= n; i++ {
+		client := ClientID(i)
+		var origin *ID
+		if version == 1 && i < n {
+			origin = &ID{Client: client + 1}
+		}
+		if version == 2 && i > 1 {
+			origin = &ID{Client: client - 1}
+		}
+		groups[client] = []*Item{{ID: ID{Client: client}, Parent: &text.abstractType, Origin: origin, Content: NewContentString("x")}}
+	}
+	if version == 2 {
+		return encodeStructStoreV2(groups, newDeleteSet(), nil, doc.store)
+	}
+	return encodeStructStoreV1(groups, newDeleteSet(), nil, doc.store)
 }

@@ -1,3 +1,5 @@
+//go:build benchheavy
+
 package crdt
 
 import (
@@ -5,30 +7,6 @@ import (
 	"fmt"
 	"testing"
 )
-
-// pendingReverseChain puts each origin in the next wire client group. Each
-// client has one item; only the last group can integrate on the first pass.
-func pendingReverseChain(version, n int) []byte {
-	doc := New()
-	defer doc.Destroy()
-	text := doc.GetText("text")
-	groups := make(map[ClientID][]*Item, n)
-	for i := 1; i <= n; i++ {
-		client := ClientID(i)
-		var origin *ID
-		if version == 1 && i < n {
-			origin = &ID{Client: client + 1}
-		}
-		if version == 2 && i > 1 {
-			origin = &ID{Client: client - 1}
-		}
-		groups[client] = []*Item{{ID: ID{Client: client}, Parent: &text.abstractType, Origin: origin, Content: NewContentString("x")}}
-	}
-	if version == 2 {
-		return encodeStructStoreV2(groups, newDeleteSet(), nil, doc.store)
-	}
-	return encodeStructStoreV1(groups, newDeleteSet(), nil, doc.store)
-}
 
 // pendingManyClientCheckpoint uses ordinary text insertions and Ygo's state
 // encoder. Assigning each transaction a distinct client ID creates the fixture

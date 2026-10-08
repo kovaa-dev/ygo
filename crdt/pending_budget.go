@@ -2,9 +2,7 @@ package crdt
 
 import (
 	"bytes"
-	"cmp"
 	"encoding/json"
-	"slices"
 	"strconv"
 	"unicode/utf8"
 
@@ -12,18 +10,18 @@ import (
 	"github.com/reearth/ygo/internal/anycodec"
 )
 
-// pendingBudget distinguishes a large complete update from a genuinely oversized
-// pending queue before the decoder materializes the rest of its items. The cheap
-// path needs no scan. At the cap, one wire pass and a dependency worklist follow
-// clocks without constructing items, content values, or shared types.
-// References merely being present in the message is insufficient: their own
-// dependencies must be reachable too (including same-client predecessors).
+// pendingBudget checks whether dependencies can resolve within this update
+// before charging its unresolved structs to the persistent pending limit.
+// Preflight retains one blocked head and a cursor per wire group, never one
+// dependency tuple per struct in a blocked tail.
 type pendingBudget struct {
 	initial   StateVector
 	update    []byte
 	remaining int
 	v2        bool
 	checked   bool
+	v2Start   *v2Decoder
+	v2Rest    encoding.Decoder
 }
 
 func newPendingBudget(doc *Doc, initial StateVector, update []byte, v2 bool) pendingBudget {
@@ -34,38 +32,109 @@ func newPendingBudget(doc *Doc, initial StateVector, update []byte, v2 bool) pen
 	return pendingBudget{initial: initial, update: update, remaining: remaining, v2: v2}
 }
 
+func (b *pendingBudget) scanner() *pendingScanner {
+	if b.v2Start == nil {
+		return newPendingScanner(b.update, b.v2)
+	}
+	// Column cursors copy by value; the immutable columns and string pool are
+	// shared with the real decoder. Only the raw rest cursor needs rebinding.
+	v2 := *b.v2Start
+	rest := b.v2Rest
+	v2.restDec = &rest
+	return &pendingScanner{v2: &v2, rest: &rest}
+}
+
 func (b *pendingBudget) check(count int) error {
 	if b.checked || count < b.remaining {
 		return nil
+	}
+	if b.remaining < 0 {
+		return ErrInvalidUpdate
 	}
 	known := make(StateVector, len(b.initial))
 	for client, clock := range b.initial {
 		known[client] = clock
 	}
-	s := newPendingScanner(b.update, b.v2)
+	heads := 0
+	// Two allocation-light passes handle permanently missing heads, cycles,
+	// and unrelated progress without retaining a head for every wire group.
+	// This bound is independent of chain length: remaining dependencies use
+	// the worklist, never an unbounded sequence of full-message scans.
+	for pass := 0; pass < 2; pass++ {
+		result, err := scanPendingGroups(b.scanner(), known, b.remaining, nil, false)
+		if err != nil {
+			return wrapUpdateErr(err)
+		}
+		if result.pending <= b.remaining {
+			b.checked = true
+			return nil
+		}
+		if !result.progressed {
+			return ErrInvalidUpdate
+		}
+		heads = result.heads
+	}
+	// The validated head count bounds this allocation. Exact capacity avoids
+	// keeping successive large backing arrays alive on fragmented updates.
+	groups := make([]pendingGroup, 0, heads)
+	result, err := scanPendingGroups(b.scanner(), known, b.remaining, groups, true)
+	if err != nil {
+		return wrapUpdateErr(err)
+	}
+	groups = result.groups
+	if len(groups) > 0 {
+		if err := resolvePendingGroups(groups, known); err != nil {
+			return wrapUpdateErr(err)
+		}
+		pending := 0
+		for i := range groups {
+			g := &groups[i]
+			for !g.done {
+				if g.end > known.Clock(g.client) {
+					pending++
+					if pending > b.remaining {
+						return ErrInvalidUpdate
+					}
+				}
+				if err := g.next(); err != nil {
+					return wrapUpdateErr(err)
+				}
+			}
+		}
+	}
+	b.checked = true
+	return nil
+}
+
+type pendingPass struct {
+	groups         []pendingGroup
+	heads, pending int
+	progressed     bool
+}
+
+func scanPendingGroups(s *pendingScanner, known StateVector, remaining int, groups []pendingGroup, collect bool) (pendingPass, error) {
+	result := pendingPass{groups: groups}
 	clients := s.uint()
 	if clients > maxV2Items {
-		return ErrInvalidUpdate
+		return result, ErrInvalidUpdate
 	}
-	var nodes []pendingSpan
 	var total uint64
 	for i := uint64(0); i < clients && s.err == nil; i++ {
 		n := s.uint()
 		total += n
 		if total > maxV2Items {
-			return ErrInvalidUpdate
+			return result, ErrInvalidUpdate
 		}
 		client, clock := s.client(), s.uint()
-		existingEnd := known.Clock(client)
+		blocked := false
 		for j := uint64(0); j < n && s.err == nil; j++ {
 			length, skip, deps, numDeps := s.item()
 			end := clock + length
 			if end < clock {
-				return ErrInvalidUpdate
+				return result, ErrInvalidUpdate
 			}
-			// Skip structs advance only the wire cursor, never known clocks.
-			if !skip && end > existingEnd {
-				ready := clock <= existingEnd
+			if !skip && end > known.Clock(client) {
+				ready := clock <= known.Clock(client)
 				for _, dep := range deps[:numDeps] {
 					if dep.Clock >= known.Clock(dep.Client) {
 						ready = false
@@ -73,148 +142,95 @@ func (b *pendingBudget) check(count int) error {
 				}
 				if ready {
 					known[client] = end
-					existingEnd = end
+					result.progressed = true
 				} else {
-					// A long same-client tail blocked on one parent needs one
-					// tuple, not one allocation per item. Equal lengths retain
-					// exact item counts if another group covers only a prefix.
-					if len(nodes) > 0 && nodes[len(nodes)-1].canExtend(client, clock, length, deps, numDeps) {
-						nodes[len(nodes)-1].end = end
-						nodes[len(nodes)-1].count++
-					} else {
-						nodes = append(nodes, pendingSpan{client: client, clock: clock, end: end, length: length, deps: deps, numDeps: numDeps, count: 1})
+					result.pending++
+					if clients == 1 && result.pending > remaining {
+						// No other group can fill this group's first blocked head. All
+						// following uncovered non-Skip structs remain permanently pending.
+						return result, ErrInvalidUpdate
+					}
+					if !blocked {
+						result.heads++
+						if collect {
+							group := pendingGroup{client: client, clock: clock, end: end, deps: deps, numDeps: numDeps, remaining: n - j - 1}
+							if group.remaining > 0 {
+								group.cursor = s.checkpoint()
+							}
+							result.groups = append(result.groups, group)
+						}
+						blocked = true
 					}
 				}
 			}
 			clock = end
 		}
 	}
-	if s.err != nil {
-		return wrapUpdateErr(s.err)
+	return result, s.err
+}
+
+// A group retains its current blocked struct and the cursor just after it.
+// Multiple/overlapping groups for one client are independent: another group
+// can cover this head even while its explicit dependencies remain missing.
+type pendingGroup struct {
+	client       ClientID
+	clock, end   uint64
+	deps         [3]ID
+	numDeps      int
+	remaining    uint64
+	cursor       *pendingCursor
+	queued, done bool
+}
+
+type pendingCursor struct {
+	scanner pendingScanner
+	rest    encoding.Decoder
+}
+
+func (s *pendingScanner) checkpoint() *pendingCursor {
+	c := &pendingCursor{scanner: *s, rest: *s.rest}
+	c.scanner.rest = &c.rest
+	if s.v2 != nil {
+		v2 := *s.v2
+		v2.restDec = &c.rest
+		c.scanner.v2 = &v2
 	}
-	if pendingSpanCount(nodes, known) > b.remaining {
-		resolvePendingSpans(nodes, known)
-		if pendingSpanCount(nodes, known) > b.remaining {
+	return c
+}
+
+func (g *pendingGroup) next() error {
+	for g.remaining > 0 {
+		s := &g.cursor.scanner
+		length, skip, deps, numDeps := s.item()
+		if s.err != nil {
+			return s.err
+		}
+		clock := g.end
+		end := clock + length
+		if end < clock {
 			return ErrInvalidUpdate
 		}
+		g.clock, g.end = clock, end
+		g.remaining--
+		if !skip {
+			g.deps, g.numDeps = deps, numDeps
+			return nil
+		}
 	}
-	b.checked = true
+	g.done = true
 	return nil
 }
 
-// pendingSpan contains only dependency metadata. Consecutive equal-length items
-// with identical dependencies share a tuple; no CRDT content is retained.
-type pendingSpan struct {
-	client             ClientID
-	clock, end, length uint64
-	deps               [3]ID
-	numDeps, count     int
-	waiting            int
-	queued, done       bool
-}
-
-func (n *pendingSpan) canExtend(client ClientID, clock, length uint64, deps [3]ID, numDeps int) bool {
-	return n.length > 0 && n.client == client && n.end == clock &&
-		n.length == length && n.numDeps == numDeps && n.deps == deps
-}
-
-// pendingSpanCount counts wire structs beyond each contiguous known frontier.
-func pendingSpanCount(nodes []pendingSpan, known StateVector) int {
-	count := 0
-	for _, n := range nodes {
-		clock := known.Clock(n.client)
-		if clock >= n.end {
-			continue
-		}
-		remaining := n.count
-		if clock > n.clock && n.length > 0 {
-			remaining -= int((clock - n.clock) / n.length)
-		}
-		count += remaining
+func (g *pendingGroup) missing(known StateVector) (ClientID, uint64, bool) {
+	if g.clock > known.Clock(g.client) {
+		return g.client, g.clock, true
 	}
-	return count
-}
-
-// Each dependency is registered once and consumed once when its client's clock
-// advances. Sorting waiters replaces repeated full-wire scans; queued tuples are
-// processed at most once, even when another client group covers their range.
-func resolvePendingSpans(nodes []pendingSpan, known StateVector) {
-	type waiter struct {
-		client ClientID
-		clock  uint64 // required next clock, inclusive
-		node   int
-		covers bool
-	}
-	var waits []waiter
-	queue := make([]int, 0, len(nodes))
-	for i := range nodes {
-		n := &nodes[i]
-		if known.Clock(n.client) >= n.end {
-			n.done = true
-			continue
-		}
-		// Coverage can make a duplicate/overlapping tuple irrelevant even
-		// while its explicit dependencies are still missing.
-		waits = append(waits, waiter{client: n.client, clock: n.end, node: i, covers: true})
-		if n.clock > known.Clock(n.client) {
-			waits = append(waits, waiter{client: n.client, clock: n.clock, node: i})
-			n.waiting++
-		}
-		for _, dep := range n.deps[:n.numDeps] {
-			if dep.Clock >= known.Clock(dep.Client) {
-				waits = append(waits, waiter{client: dep.Client, clock: dep.Clock + 1, node: i})
-				n.waiting++
-			}
-		}
-		if n.waiting == 0 {
-			n.queued = true
-			queue = append(queue, i)
+	for _, dep := range g.deps[:g.numDeps] {
+		if dep.Clock >= known.Clock(dep.Client) {
+			return dep.Client, dep.Clock + 1, true
 		}
 	}
-	slices.SortFunc(waits, func(a, b waiter) int {
-		if a.client != b.client {
-			return cmp.Compare(a.client, b.client)
-		}
-		return cmp.Compare(a.clock, b.clock)
-	})
-	type interval struct{ next, end int }
-	byClient := make(map[ClientID]interval)
-	for i := 0; i < len(waits); {
-		end := i + 1
-		for end < len(waits) && waits[end].client == waits[i].client {
-			end++
-		}
-		byClient[waits[i].client] = interval{next: i, end: end}
-		i = end
-	}
-	for head := 0; head < len(queue); head++ {
-		n := &nodes[queue[head]]
-		if n.done {
-			continue
-		}
-		n.done = true
-		if known.Clock(n.client) >= n.end {
-			continue
-		}
-		known[n.client] = n.end
-		window := byClient[n.client]
-		for window.next < window.end && waits[window.next].clock <= n.end {
-			w := waits[window.next]
-			window.next++
-			target := &nodes[w.node]
-			if target.done || target.queued {
-				continue
-			}
-			if !w.covers {
-				target.waiting--
-			}
-			if w.covers || target.waiting == 0 {
-				target.queued = true
-				queue = append(queue, w.node)
-			}
-		}
-		byClient[n.client] = window
-	}
+	return 0, 0, false
 }
 
 // Only decoder cursors and scalar clocks survive a scan. V1 reads the caller's
@@ -435,7 +451,7 @@ func (s *pendingScanner) content(tag byte) uint64 {
 		} else {
 			for i := uint64(0); i < n && s.err == nil; i++ {
 				if tag == wireJSON {
-					s.text()
+					s.json()
 				} else {
 					s.any()
 				}
@@ -448,14 +464,14 @@ func (s *pendingScanner) content(tag byte) uint64 {
 		return s.text()
 	case wireEmbed:
 		if s.v2 == nil {
-			s.text()
+			s.json()
 		} else {
 			s.any()
 		}
 	case wireFormat:
 		s.key()
 		if s.v2 == nil {
-			s.text()
+			s.json()
 		} else {
 			s.any()
 		}
@@ -486,6 +502,22 @@ func (s *pendingScanner) content(tag byte) uint64 {
 	return 1
 }
 
+// json validates JSON-bearing content without materializing its values.
+func (s *pendingScanner) json() {
+	if s.err != nil {
+		return
+	}
+	if s.v2 == nil {
+		s.err = skipJSONVals(s.rest, 1)
+		return
+	}
+	var value string
+	value, s.err = s.v2.readString()
+	if s.err == nil {
+		s.err = validatePendingJSON([]byte(value))
+	}
+}
+
 // skipJSONVals validates V1 JSON text without allocating decoded values.
 func skipJSONVals(dec *encoding.Decoder, n uint64) error {
 	for i := uint64(0); i < n; i++ {
@@ -493,35 +525,41 @@ func skipJSONVals(dec *encoding.Decoder, n uint64) error {
 		if err != nil {
 			return err
 		}
-		if !utf8.Valid(raw) {
-			return encoding.ErrInvalidUTF8
+		if err := validatePendingJSON(raw); err != nil {
+			return err
 		}
-		if bytes.Equal(raw, []byte("undefined")) {
-			continue
-		}
-		if !json.Valid(raw) {
-			return ErrInvalidUpdate
-		}
-		// Unmarshal rejects numbers outside float64's range. Preserve that
-		// decision too: it determines the legacy fallback for ambiguous
-		// 116–127-byte strings. JSON syntax is already validated above.
-		for j := 0; j < len(raw); j++ {
-			if raw[j] == '"' {
-				for j++; raw[j] != '"'; j++ {
-					if raw[j] == '\\' {
-						j++
-					}
-				}
-			} else if raw[j] == '-' || raw[j] >= '0' && raw[j] <= '9' {
-				start := j
-				for j < len(raw) && (raw[j] >= '0' && raw[j] <= '9' || raw[j] == '-' || raw[j] == '+' || raw[j] == '.' || raw[j] == 'e' || raw[j] == 'E') {
+	}
+	return nil
+}
+
+// Match json.Unmarshal's syntax and float-range validation. This also keeps
+// the V1 legacy Any fallback's choice consistent for ambiguous 116–127 bytes.
+func validatePendingJSON(raw []byte) error {
+	if !utf8.Valid(raw) {
+		return encoding.ErrInvalidUTF8
+	}
+	if bytes.Equal(raw, []byte("undefined")) {
+		return nil
+	}
+	if !json.Valid(raw) {
+		return ErrInvalidUpdate
+	}
+	for j := 0; j < len(raw); j++ {
+		if raw[j] == '"' {
+			for j++; raw[j] != '"'; j++ {
+				if raw[j] == '\\' {
 					j++
 				}
-				if _, err := strconv.ParseFloat(string(raw[start:j]), 64); err != nil {
-					return ErrInvalidUpdate
-				}
-				j--
 			}
+		} else if raw[j] == '-' || raw[j] >= '0' && raw[j] <= '9' {
+			start := j
+			for j < len(raw) && (raw[j] >= '0' && raw[j] <= '9' || raw[j] == '-' || raw[j] == '+' || raw[j] == '.' || raw[j] == 'e' || raw[j] == 'E') {
+				j++
+			}
+			if _, err := strconv.ParseFloat(string(raw[start:j]), 64); err != nil {
+				return ErrInvalidUpdate
+			}
+			j--
 		}
 	}
 	return nil

@@ -88,9 +88,6 @@ func (d *Decoder) ReadFloat64() (float64, error) { return d.cursor.ReadFloat64()
 // ReadBigInt64 reads a signed 64-bit big-endian integer.
 func (d *Decoder) ReadBigInt64() (int64, error) { return d.cursor.ReadBigInt64() }
 
-// readVarIntWithSign preserves the sign bit, including negative zero, for RLE.
-func (d *Decoder) readVarIntWithSign() (uint64, bool, error) { return d.cursor.ReadVarIntWithSign() }
-
 // ReadAny decodes a tagged-union value written by Encoder.WriteAny.
 // Nested arrays and maps are limited to maxAnyDepth levels to prevent
 // stack-overflow DoS from crafted inputs.
