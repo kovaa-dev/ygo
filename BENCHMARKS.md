@@ -312,6 +312,14 @@ cross-impl performance numbers: "faster than yrs" and "as conformant as
 yrs" are separate claims, and on the conformance axis ygo already has
 better-documented parity with the Yjs reference than yrs does.
 
+## Fork integration scope
+
+The 2026-10-08 fork combines main `07bd8f62` with PRs #258, #259, #260,
+#261 and #296 and preserves its server resource-budget APIs. The comparisons
+below measure the individual upstream proposals against their stated bases,
+not this combined fork. Integration resource regressions additionally exercise
+reservation refusal and cancellation in preflight and producer scheduling.
+
 ## Pending-budget preflight review
 
 The pending-budget benchmarks use the `benchheavy` tag. Reverse chains cover

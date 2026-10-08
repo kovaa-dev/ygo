@@ -382,6 +382,12 @@ func encodeContent(enc *encoding.Encoder, c Content, offset int) {
 				return
 			}
 			// Yjs writes JSON text per value in V1 too, not lib0 Any.
+			if enc.Budgeted() {
+				if err := admitSemanticValue(v, enc); err != nil {
+					enc.Fail(err)
+					return
+				}
+			}
 			enc.WriteVarString(fmtValToJSON(v))
 		}
 	case *ContentBinary:
@@ -1035,16 +1041,26 @@ func decodeContent(dec *encoding.Decoder, doc *Doc, tag byte) (Content, error) {
 		// 116–127, as does a 116–127-byte JSON text. One encoder writes the
 		// whole item, so try JSON text for all values, else Any for all.
 		// JSON text (Yjs) wins input valid both ways.
-		rem := dec.RemainingBytes()
-		sub := encoding.NewDecoder(rem)
-		vals, jsonErr := readJSONVals(sub, n)
+		// Probe only the wire shape: deciding between legacy Any and JSON
+		// must not materialize unbudgeted object trees or charge the wrong
+		// interpretation to the shared decode budget.
+		if err := dec.ReserveAllocation(0); err != nil {
+			return nil, err
+		}
+		probe := encoding.NewDecoder(dec.RemainingBytes())
+		jsonErr := skipJSONVals(probe, n)
 		if jsonErr == nil {
-			for range len(rem) - sub.Remaining() {
-				_, _ = dec.ReadUint8()
+			vals, err := readJSONVals(dec, n)
+			if err != nil {
+				return nil, err
 			}
 			return NewContentJSON(vals...), nil
 		}
-		if vals, err = readLegacyAnyVals(dec, n); err != nil {
+		vals, err := readLegacyAnyVals(dec, n)
+		if err != nil {
+			if refusal := dec.BudgetError(); refusal != nil {
+				return nil, refusal
+			}
 			return nil, jsonErr
 		}
 		return NewContentJSON(vals...), nil
@@ -1368,6 +1384,9 @@ func readJSONVals(dec *encoding.Decoder, n uint64) ([]any, error) {
 	for i := range vals {
 		js, err := dec.ReadVarString()
 		if err != nil {
+			return nil, err
+		}
+		if err := dec.ReserveValues(uint64(len(js))); err != nil {
 			return nil, err
 		}
 		if vals[i], err = fmtValFromJSON(js); err != nil {

@@ -5,27 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.51.3] — 2026-10-08
+## Fork integration — 2026-10-08 (unreleased)
 
 ### Fixed
 
-- Resolve dependencies in complete V1/V2 checkpoints before applying the
-  cross-update pending limit. Preflight retains one blocked head and a decoder
-  cursor per wire group, preventing large per-struct metadata allocations on
-  incomplete updates. V2 cursors share immutable column data; single-group
-  updates reject oversized blocked tails early. Rejected preflight updates
-  add no deferred items to the persistent pending queue, retain previously
-  queued items, and do not roll back changes already integrated. The pending
-  limit, wire format and public API are unchanged.
-### Changed
+- Integrate upstream main through `07bd8f62` and contribution PRs #258, #259,
+  #260, #261 and #296. GC delete ranges start with a binary search; map
+  replacement and conflict scans avoid unrelated keys. Complete V1/V2
+  checkpoints resolve in-message dependencies before the persistent pending
+  limit is applied. Preflight retains a blocked head and cursor per wire group,
+  with a bounded number of full-message passes. Rejections park no new deferred
+  items and retain previously pending items; already integrated changes are
+  not rolled back.
+- Schedule large within-update dependency queues in producer-first order with
+  an immutable range index; all-ready and no-progress queues avoid indexing.
+  Unresolved/overlapping ranges retain the retry fallback and existing cap.
+- Preserve the fork's read-only inspection, processing/allocation budgets,
+  budgeted encoding, local mutations and semantic reads. Charge preflight
+  cursors, watcher growth and resolver indexing before allocation; preserve
+  refusal/cancellation identity. Reserve JSON workspace before materializing
+  ContentJSON values introduced by upstream's V1 compatibility fix.
 
-- Resolve large within-update dependency queues in producer-first order,
-  avoiding repeated full-queue retries on reverse client chains. Queues that
-  resolve in one pass or make no progress do not allocate a dependency index.
-  The sorted index stores immutable ranges and uses temporary memory
-  proportional to the remaining queue. Unresolved and overlapping ranges
-  retain fixed-point retries and the existing persistent pending limit.
-  Public API, wire format and cross-update drain behavior are unchanged.
+No new fork API, wire-format change, release tag or upstream PR merge.
 
 ## [1.51.2] — 2026-10-08
 
@@ -41,8 +42,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [1.51.1] — 2026-10-07
 
 ### Fixed
-
-- Avoid repeated prefix scans when collecting sparse transaction delete ranges. The range starts at the containing struct found by binary search; partial overlaps and tombstones retain their existing behavior.
 
 - **`crdt`: undo restored a deleted nested type empty.** `ContentType.Copy`
   shared the original type, whose children were all tombstoned, and

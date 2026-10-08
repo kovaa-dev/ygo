@@ -29,7 +29,10 @@ func (b *DecodeBudget) check() error {
 		return b.err
 	}
 	if b.Context != nil {
-		return b.Context.Err()
+		if err := b.Context.Err(); err != nil {
+			b.err = err
+			return err
+		}
 	}
 	return nil
 }

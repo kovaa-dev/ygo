@@ -39,6 +39,7 @@ func (h *pendingWatchHeap) Pop() any {
 }
 
 type pendingGroupWorklist struct {
+	budget       *ProcessingBudget
 	groups       []pendingGroup
 	waits        []pendingWatch
 	byClient     map[ClientID]*pendingWatchHeap
@@ -49,6 +50,7 @@ type pendingGroupWorklist struct {
 func (w *pendingGroupWorklist) cancel(index int) {
 	wait := &w.waits[index]
 	if owner := wait.owner; owner != nil {
+		w.budget.mustWork(nLog(uint64(owner.Len())))
 		heap.Remove(owner, wait.index)
 		if owner.Len() == 0 {
 			delete(w.byClient, owner.client)
@@ -57,6 +59,7 @@ func (w *pendingGroupWorklist) cancel(index int) {
 }
 
 func (w *pendingGroupWorklist) enqueue(group int) {
+	w.budget.mustWork(1)
 	w.cancel(2 * group)
 	w.cancel(2*group + 1)
 	g := &w.groups[group]
@@ -71,8 +74,13 @@ func (w *pendingGroupWorklist) enqueue(group int) {
 func (w *pendingGroupWorklist) watch(index int, client ClientID, clock uint64, group int) {
 	h := w.byClient[client]
 	if h == nil {
+		w.budget.mustAllocate(128)
 		h = &pendingWatchHeap{client: client}
 		w.byClient[client] = h
+	}
+	w.budget.mustWork(nLog(uint64(h.Len() + 1)))
+	if len(h.items) == cap(h.items) {
+		w.budget.mustAllocate(uint64(2*cap(h.items)+1)*8 + 64)
 	}
 	wait := &w.waits[index]
 	wait.clock, wait.group = clock, group
@@ -91,25 +99,38 @@ func (w *pendingGroupWorklist) advance(client ClientID, clock uint64) {
 
 func resolvePendingGroups(groups []pendingGroup, known StateVector, resources ...*ProcessingBudget) error {
 	var budget *ProcessingBudget
-	if len(resources) > 0 { budget = resources[0] }
-	w := pendingGroupWorklist{groups: groups, waits: make([]pendingWatch, 2*len(groups)), byClient: make(map[ClientID]*pendingWatchHeap, len(groups)), queue: make([]int, len(groups))}
+	if len(resources) > 0 {
+		budget = resources[0]
+	}
+	w := pendingGroupWorklist{budget: budget, groups: groups, waits: make([]pendingWatch, 2*len(groups)), byClient: make(map[ClientID]*pendingWatchHeap, len(groups)), queue: make([]int, len(groups))}
 	for i := range groups {
-		if !budget.step(1) { return budget.err }		w.enqueue(i)
+		if !budget.step(1) {
+			return budget.err
+		}
+		w.enqueue(i)
 	}
 	for w.count > 0 {
-		if !budget.step(1) { return budget.err }		index := w.queue[w.front]
+		if !budget.step(1) {
+			return budget.err
+		}
+		index := w.queue[w.front]
 		w.front = (w.front + 1) % len(w.queue)
 		w.count--
 		g := &groups[index]
 		g.queued = false
 		for !g.done {
-			if !budget.step(1) { return budget.err }			if g.end > known.Clock(g.client) {
+			if !budget.step(1) {
+				return budget.err
+			}
+			if g.end > known.Clock(g.client) {
 				if client, clock, missing := g.missing(known); missing {
 					w.watch(2*index, client, clock, index)
 					w.watch(2*index+1, g.client, g.end, index)
 					break
 				}
-				if _, exists := known[g.client]; !exists && !budget.allocate(128) { return budget.err }
+				if _, exists := known[g.client]; !exists && !budget.allocate(128) {
+					return budget.err
+				}
 				known[g.client] = g.end
 				w.advance(g.client, g.end)
 			}

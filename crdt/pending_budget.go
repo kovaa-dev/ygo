@@ -60,7 +60,17 @@ func (b *pendingBudget) scanner() *pendingScanner {
 	return s
 }
 
-func (b *pendingBudget) check(count int) error {
+func (b *pendingBudget) check(count int) (resultErr error) {
+	defer func() {
+		if b.decodeBudget != nil && b.processing != nil && resultErr != nil {
+			// Scanner decoders own their sticky value/payload refusal too.
+			probe := encoding.NewDecoderWithBudget(nil, b.decodeBudget)
+			if err := probe.BudgetError(); err != nil {
+				b.processing.err = err
+				resultErr = err
+			}
+		}
+	}()
 	if b.checked || count < b.remaining {
 		return nil
 	}
@@ -473,6 +483,10 @@ func (s *pendingScanner) content(tag byte) uint64 {
 			// without constructing the values or their nested object trees.
 			probe := *s.rest
 			jsonErr := skipJSONVals(&probe, n)
+			if refusal := probe.BudgetError(); refusal != nil {
+				s.err = refusal
+				return 0
+			}
 			if jsonErr == nil {
 				*s.rest = probe
 			} else if n > 0 && isAnyTag(s.rest.RemainingBytes()[0]) {

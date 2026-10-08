@@ -1,24 +1,23 @@
-## v1.51.3
+## Fork integration — 2026-10-08 (unreleased)
 
-Complete V1/V2 checkpoints resolve dependencies within the update before the
-cross-update pending limit is applied. Preflight retains the current blocked
-struct and a resumable decoder cursor per wire group, rather than metadata for
-every struct in a blocked tail. V2 cursors share immutable columns and the
-string pool. Single-group updates stop once the number of permanently blocked
-structs exceeds the remaining budget. A rejected preflight update adds none of
-its deferred items to the persistent pending queue; previously queued items
-remain. Changes already integrated before rejection are not rolled back.
-The configured pending limit, wire format and public API are unchanged.
-Large updates whose structs depend on later client groups restore much faster.
-The within-update resolver processes dependencies before their consumers instead
-of repeatedly scanning a reverse chain. Queues already resolvable in one pass,
-and queues waiting entirely on missing data, avoid allocating the search index.
-Complex queues use temporary storage proportional to the remaining item count;
-unresolved and overlapping cases retain the existing retry fallback.
+This fork snapshot combines upstream main through `07bd8f62` with contribution
+PRs #258, #259, #260, #261 and #296. It speeds up sparse delete-range collection,
+map replacement/conflict scans and complete checkpoint restoration. Preflight
+keeps one blocked head/cursor per group; the within-update resolver visits
+producers before their consumers. Persistent pending limits and standard Yjs
+wire/storage formats are preserved. Failed applies still require discarding
+partially mutated candidates; preflight rejection does not park new deferred
+items and keeps previously queued items.
 
-No public API or wire-format change. The configured persistent pending limit
-and cross-update drain behavior are unchanged. This optimization is separate
-from the pending-budget preflight fix in #260.
+The existing server-owned fork APIs for inspection, cooperative resource budgets,
+encoding and local history mutations remain available. New scanner, watcher and
+resolver paths honor allocation/work reservations and cancellation. JSON content
+is admitted before constructing nested objects. These budgets are conservative
+operational charges, not an exact heap/RSS limit.
+
+This is an immutable fork snapshot, not a tagged upstream release. Separate
+upstream proposals and their benchmark comparisons remain in BENCHMARKS.md;
+those tables do not claim measurements of this combined snapshot.
 
 ## v1.51.2
 
@@ -35,8 +34,6 @@ everyone else for good. Accessing a root now picks up waiting updates too.
 **Upgrading.** No API change.
 
 ## v1.51.1
-
-Avoid repeated prefix scans when collecting sparse transaction delete ranges. The range starts at the containing struct found by binary search; partial overlaps and tombstones retain their existing behavior.
 
 **Who is affected:** anyone using `UndoManager` or `YArray.Move`, and anyone
 exchanging V1 updates with yjs peers that carry legacy JSON content.
