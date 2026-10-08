@@ -376,3 +376,134 @@ The resource regression test checks allocated bytes on varied dependencies,
 lengths, cycles and many client groups; reverting to the old per-struct worklist
 makes it fail. Generated raw samples, frozen binaries and full comparisons are
 saved locally under `/tmp/ygo-pr260-review/`; they are not repository artifacts.
+
+### Main versus final pending-budget fix
+
+Both comparisons below use Go 1.26.8 and ten samples per workload. `main` is
+`07bd8f62`; `fixed` is the final group-cursor implementation. The batches were
+run separately, so small timing differences are not a paired regression verdict.
+The complete cases report zero rejections. The resolver prototype is excluded.
+
+The complete reverse chains are still slower than main: 20k cases take about
+4.0–4.1 s versus 3.0 s, despite much lower cumulative allocation volume. The
+500k same-parent incomplete cases take about 14–15 ms versus 11 ms. These
+trade-offs are distinct from the removed unbounded preflight rescans and the
+fixed per-struct metadata memory regression. The inherited integration resolver
+is a separate optimization; this change does not claim linear whole-Apply cost.
+
+Release entries use 1.51.3 because main already contains 1.51.1 and 1.51.2.
+The release version and date should be reconciled with the maintainer at merge.
+
+
+<details>
+<summary>Ordinary Apply and incomplete updates (`-benchtime=100ms`)</summary>
+
+```text
+goos: darwin
+goarch: arm64
+pkg: github.com/reearth/ygo/crdt
+cpu: Apple M4 Pro
+                              │ main │ fixed │
+                              │                sec/op                 │      sec/op        vs base                │
+ApplyUpdateV1-12                                          118.7µ ± 1%        113.4µ ±  2%   -4.40% (p=0.000 n=10)
+ApplyUpdateV1_Bulk-12                                     1.897µ ± 1%        1.849µ ±  4%   -2.53% (p=0.022 n=10)
+ApplyUpdateV2-12                                          119.9µ ± 3%        114.9µ ± 12%   -4.18% (p=0.023 n=10)
+ApplyUpdateV2_Bulk-12                                     2.886µ ± 2%        2.736µ ±  3%   -5.18% (p=0.001 n=10)
+PendingUpdateIncomplete/V1-12                             11.11m ± 2%        14.08m ±  6%  +26.70% (p=0.000 n=10)
+PendingUpdateIncomplete/V2-12                             10.85m ± 3%        14.68m ±  9%  +35.29% (p=0.000 n=10)
+geomean                                                   145.3µ             154.6µ         +6.40%
+
+                              │ main │ fixed │
+                              │                 B/op                  │       B/op        vs base                 │
+ApplyUpdateV1-12                                         223.1Ki ± 0%       223.1Ki ± 0%       ~ (p=0.840 n=10)
+ApplyUpdateV1_Bulk-12                                    3.646Ki ± 0%       3.646Ki ± 0%       ~ (p=1.000 n=10) ¹
+ApplyUpdateV2-12                                         225.8Ki ± 0%       226.3Ki ± 0%  +0.21% (p=0.000 n=10)
+ApplyUpdateV2_Bulk-12                                    5.337Ki ± 0%       5.806Ki ± 0%  +8.78% (p=0.000 n=10)
+PendingUpdateIncomplete/V1-12                            23.36Mi ± 0%       23.36Mi ± 0%       ~ (p=0.105 n=10)
+PendingUpdateIncomplete/V2-12                            28.12Mi ± 0%       28.12Mi ± 0%  +0.00% (p=0.000 n=10)
+geomean                                                  296.2Ki            300.5Ki       +1.45%
+¹ all samples are equal
+
+                              │ main │ fixed │
+                              │               allocs/op               │    allocs/op     vs base                  │
+ApplyUpdateV1-12                                          3.087k ± 0%       3.087k ± 0%        ~ (p=1.000 n=10) ¹
+ApplyUpdateV1_Bulk-12                                      37.00 ± 0%        37.00 ± 0%        ~ (p=1.000 n=10) ¹
+ApplyUpdateV2-12                                          3.114k ± 0%       3.096k ± 0%   -0.58% (p=0.000 n=10)
+ApplyUpdateV2_Bulk-12                                      62.00 ± 0%        44.00 ± 0%  -29.03% (p=0.000 n=10)
+PendingUpdateIncomplete/V1-12                             699.8k ± 0%       699.8k ± 0%   -0.00% (p=0.000 n=10)
+PendingUpdateIncomplete/V2-12                             599.8k ± 0%       599.8k ± 0%   -0.00% (p=0.000 n=10)
+geomean                                                   4.582k            4.323k        -5.65%
+¹ all samples are equal
+```
+
+</details>
+
+
+<details>
+<summary>Complete reverse chains and checkpoints (`-benchtime=1x`)</summary>
+
+```text
+goos: darwin
+goarch: arm64
+pkg: github.com/reearth/ygo/crdt
+cpu: Apple M4 Pro
+                                                    │ main │ fixed │
+                                                    │             sec/op             │       sec/op         vs base                │
+PendingReverseChain/V1/n=1000/cap=16-12                                 5.453m ±  9%          8.800m ±  4%  +61.39% (p=0.000 n=10)
+PendingReverseChain/V1/n=1000/cap=1001-12                               5.123m ±  2%          8.395m ±  4%  +63.85% (p=0.000 n=10)
+PendingReverseChain/V1/n=20000/cap=16-12                                 2.968 ± 10%           4.109 ±  6%  +38.46% (p=0.000 n=10)
+PendingReverseChain/V1/n=20000/cap=20001-12                              2.912 ±  1%           4.000 ± 18%  +37.37% (p=0.000 n=10)
+PendingReverseChain/V2/n=1000/cap=16-12                                 5.236m ±  5%          8.561m ±  3%  +63.51% (p=0.000 n=10)
+PendingReverseChain/V2/n=1000/cap=1001-12                               5.336m ±  5%          8.414m ±  1%  +57.68% (p=0.000 n=10)
+PendingReverseChain/V2/n=20000/cap=16-12                                 2.969 ±  1%           4.042 ±  4%  +36.13% (p=0.000 n=10)
+PendingReverseChain/V2/n=20000/cap=20001-12                              2.985 ±  1%           3.966 ±  1%  +32.84% (p=0.000 n=10)
+PendingManyClientCheckpoint/V2/n=10000/cap=16-12                        730.5m ±  5%          939.6m ±  2%  +28.62% (p=0.000 n=10)
+PendingManyClientCheckpoint/V2/n=10000/cap=10001-12                     725.4m ±  1%          936.7m ±  1%  +29.13% (p=0.000 n=10)
+geomean                                                                 177.9m                256.5m        +44.23%
+
+                                                    │ main │ fixed │
+                                                    │         rejections/op          │   rejections/op     vs base                 │
+PendingReverseChain/V1/n=1000/cap=16-12                                 0.000 ± 0%             0.000 ± 0%       ~ (p=1.000 n=10) ¹
+PendingReverseChain/V1/n=1000/cap=1001-12                               0.000 ± 0%             0.000 ± 0%       ~ (p=1.000 n=10) ¹
+PendingReverseChain/V1/n=20000/cap=16-12                                0.000 ± 0%             0.000 ± 0%       ~ (p=1.000 n=10) ¹
+PendingReverseChain/V1/n=20000/cap=20001-12                             0.000 ± 0%             0.000 ± 0%       ~ (p=1.000 n=10) ¹
+PendingReverseChain/V2/n=1000/cap=16-12                                 0.000 ± 0%             0.000 ± 0%       ~ (p=1.000 n=10) ¹
+PendingReverseChain/V2/n=1000/cap=1001-12                               0.000 ± 0%             0.000 ± 0%       ~ (p=1.000 n=10) ¹
+PendingReverseChain/V2/n=20000/cap=16-12                                0.000 ± 0%             0.000 ± 0%       ~ (p=1.000 n=10) ¹
+PendingReverseChain/V2/n=20000/cap=20001-12                             0.000 ± 0%             0.000 ± 0%       ~ (p=1.000 n=10) ¹
+PendingManyClientCheckpoint/V2/n=10000/cap=16-12                        0.000 ± 0%             0.000 ± 0%       ~ (p=1.000 n=10) ¹
+PendingManyClientCheckpoint/V2/n=10000/cap=10001-12                     0.000 ± 0%             0.000 ± 0%       ~ (p=1.000 n=10) ¹
+geomean                                                                            ²                       +0.00%                ²
+¹ all samples are equal
+² summaries must be >0 to compute geomean
+
+                                                    │ main │ fixed │
+                                                    │              B/op              │        B/op          vs base                │
+PendingReverseChain/V1/n=1000/cap=16-12                               10997.1Ki ± 0%          887.9Ki ± 0%  -91.93% (p=0.000 n=10)
+PendingReverseChain/V1/n=1000/cap=1001-12                             10997.1Ki ± 0%          548.6Ki ± 0%  -95.01% (p=0.000 n=10)
+PendingReverseChain/V1/n=20000/cap=16-12                              6487.44Mi ± 0%          16.35Mi ± 0%  -99.75% (p=0.000 n=10)
+PendingReverseChain/V1/n=20000/cap=20001-12                           6487.44Mi ± 0%          10.22Mi ± 0%  -99.84% (p=0.000 n=10)
+PendingReverseChain/V2/n=1000/cap=16-12                               11002.8Ki ± 0%          895.8Ki ± 0%  -91.86% (p=0.000 n=10)
+PendingReverseChain/V2/n=1000/cap=1001-12                             11002.8Ki ± 0%          554.7Ki ± 0%  -94.96% (p=0.000 n=10)
+PendingReverseChain/V2/n=20000/cap=16-12                              6487.55Mi ± 0%          16.46Mi ± 0%  -99.75% (p=0.000 n=10)
+PendingReverseChain/V2/n=20000/cap=20001-12                           6487.55Mi ± 0%          10.33Mi ± 0%  -99.84% (p=0.000 n=10)
+PendingManyClientCheckpoint/V2/n=10000/cap=16-12                     1489.218Mi ± 0%          8.094Mi ± 0%  -99.46% (p=0.000 n=10)
+PendingManyClientCheckpoint/V2/n=10000/cap=10001-12                  1489.218Mi ± 0%          5.024Mi ± 0%  -99.66% (p=0.000 n=10)
+geomean                                                                 373.1Mi               3.471Mi       -99.07%
+
+                                                    │ main │ fixed │
+                                                    │           allocs/op            │      allocs/op       vs base                │
+PendingReverseChain/V1/n=1000/cap=16-12                                 14.895k ± 0%           8.107k ± 0%  -45.57% (p=0.000 n=10)
+PendingReverseChain/V1/n=1000/cap=1001-12                               14.894k ± 0%           5.083k ± 0%  -65.87% (p=0.000 n=10)
+PendingReverseChain/V1/n=20000/cap=16-12                                 448.9k ± 0%           160.6k ± 0%  -64.22% (p=0.000 n=10)
+PendingReverseChain/V1/n=20000/cap=20001-12                              448.9k ± 0%           100.4k ± 0%  -77.63% (p=0.000 n=10)
+PendingReverseChain/V2/n=1000/cap=16-12                                 14.921k ± 0%           8.119k ± 0%  -45.59% (p=0.000 n=10)
+PendingReverseChain/V2/n=1000/cap=1001-12                               14.921k ± 0%           5.092k ± 0%  -65.87% (p=0.000 n=10)
+PendingReverseChain/V2/n=20000/cap=16-12                                 448.9k ± 0%           160.6k ± 0%  -64.22% (p=0.000 n=10)
+PendingReverseChain/V2/n=20000/cap=20001-12                              448.9k ± 0%           100.4k ± 0%  -77.63% (p=0.000 n=10)
+PendingManyClientCheckpoint/V2/n=10000/cap=16-12                        202.75k ± 0%           80.37k ± 0%  -60.36% (p=0.000 n=10)
+PendingManyClientCheckpoint/V2/n=10000/cap=10001-12                     202.75k ± 0%           50.25k ± 0%  -75.22% (p=0.000 n=10)
+geomean                                                                  98.09k                33.52k       -65.83%
+```
+
+</details>
