@@ -685,16 +685,12 @@ func applyV2Txn(txn *Transaction, update []byte) (retErr error) {
 				}
 				contentLen = int(length)
 
-			case 10: // Skip struct
+			case 10: // Skip struct: withheld clocks; advance the cursor only (see V1 decodeAndPark)
 				l, err := dec.restDec.ReadVarUint()
 				if err != nil {
 					return wrapUpdateErr(err)
 				}
-				skipEnd := clock + l
-				if skipEnd > existingEnd {
-					existingEnd = skipEnd
-				}
-				clock = skipEnd
+				clock += l
 				continue
 
 			default:
@@ -1012,14 +1008,8 @@ func decodeContentV2(dec *v2Decoder, doc *Doc, tag byte) (Content, error) {
 			if err != nil {
 				return nil, err
 			}
-			if s == "undefined" {
-				vals[i] = nil
-			} else {
-				v, err := fmtValFromJSON(s)
-				if err != nil {
-					return nil, err
-				}
-				vals[i] = v
+			if vals[i], err = fmtValFromJSON(s); err != nil {
+				return nil, err
 			}
 		}
 		return NewContentJSON(vals...), nil
