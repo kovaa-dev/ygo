@@ -111,9 +111,13 @@ func TestUnit_PendingBudget_CursorBombAllocations(t *testing.T) {
 			if !errors.Is(err, ErrInvalidUpdate) || doc.PendingStats().Items != 0 {
 				t.Fatalf("err=%v pending=%d", err, doc.PendingStats().Items)
 			}
-			// A compact wire-bound entry per group plus normal V2 columns fits
-			// within twice the wire size; per-group decoder snapshots do not.
-			if allocated := after.TotalAlloc - before.TotalAlloc; allocated > uint64(2*len(update)+64*1024) {
+			// Ordered unique groups with an external dependency need no index
+			// or cursors; only V2's normal columns may scale with wire size.
+			limit := uint64(64 * 1024)
+			if version == 2 {
+				limit += uint64(len(update))
+			}
+			if allocated := after.TotalAlloc - before.TotalAlloc; allocated > limit {
 				t.Fatalf("wire=%d allocated=%d", len(update), allocated)
 			}
 		})
@@ -171,6 +175,70 @@ func TestUnit_PendingBudget_WireBoundsMatchReference(t *testing.T) {
 					}
 				}
 			})
+		}
+	}
+}
+
+// Compare early range rejection with the independent fixed-point oracle,
+// including directions, gaps, already-known external IDs, and duplicate groups.
+func TestUnit_PendingBudget_ClientRangeMatchesReference(t *testing.T) {
+	for _, version := range []int{1, 2} {
+		for _, order := range []string{"ascending", "descending", "unordered", "duplicate"} {
+			for _, shape := range []string{"below", "above", "middle", "known", "clock-gap"} {
+				t.Run(fmt.Sprintf("V%d/%s/%s", version, order, shape), func(t *testing.T) {
+					source := New()
+					defer source.Destroy()
+					text := source.GetText("text")
+					clients := []ClientID{2, 4, 6, 8, 10}
+					if order == "descending" {
+						clients = []ClientID{10, 8, 6, 4, 2}
+					}
+					groups := make([][]*Item, 0, 8)
+					for i, c := range clients {
+						var origin *ID
+						if i+1 < len(clients) {
+							origin = &ID{Client: clients[i+1]}
+						}
+						groups = append(groups, []*Item{{ID: ID{Client: c}, Parent: &text.abstractType, Origin: origin, Content: NewContentString("x")}})
+					}
+					dep, clock := ID{Client: 30}, uint64(0)
+					initial := StateVector{}
+					switch shape {
+					case "below":
+						dep.Client = 0
+					case "middle":
+						dep.Client = 7
+					case "known":
+						initial[30] = 1
+					case "clock-gap":
+						clock, dep.Client = 1, clients[len(clients)-1]
+					}
+					head := []*Item{
+						{ID: ID{Client: 20, Clock: clock}, Parent: &text.abstractType, Origin: &dep, Content: NewContentString("h")},
+						{ID: ID{Client: 20, Clock: clock + 1}, Parent: &text.abstractType, Origin: &ID{Client: 20, Clock: clock}, Content: NewContentString("t")},
+					}
+					if order == "descending" {
+						groups = append([][]*Item{head}, groups...)
+					} else {
+						groups = append(groups, head)
+					}
+					if order == "unordered" {
+						groups[0], groups[1] = groups[1], groups[0]
+					}
+					if order == "duplicate" {
+						// A late overlapping group may cover an otherwise impossible
+						// head; the global range must not classify it as permanent.
+						groups = append(groups, []*Item{{ID: ID{Client: 20}, Parent: &text.abstractType, Origin: &ID{Client: 2}, Content: NewContentString("cc")}})
+					}
+					update := pendingGuardUpdate(source, groups, nil, version)
+					for _, cap := range []int{0, 1, 2, 3} {
+						b := pendingBudget{initial: initial, update: update, v2: version == 2, remaining: cap}
+						if want, got := referencePendingBudgetCheck(b, cap), b.check(cap); (want == nil) != (got == nil) {
+							t.Fatalf("cap=%d reference=%v preflight=%v", cap, want, got)
+						}
+					}
+				})
+			}
 		}
 	}
 }

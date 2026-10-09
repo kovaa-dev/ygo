@@ -57,13 +57,30 @@ func (b *pendingBudget) check(count int) error {
 		known[client] = clock
 	}
 	heads := 0
+	var clients pendingClientRange
 	// Two allocation-light passes handle permanently missing heads, cycles,
 	// and unrelated progress without retaining a head for every wire group.
 	// This bound is independent of chain length: remaining dependencies use
 	// the worklist, never an unbounded sequence of full-message scans.
 	for pass := 0; pass < 2; pass++ {
-		result, err := scanPendingGroups(b.scanner(), known, b.remaining, nil, false)
+		var result pendingPass
+		var err error
+		if pass == 0 {
+			result, err = scanPendingGroups(b.scanner(), known, b.remaining, &clients)
+		} else {
+			var clientRange *pendingClientRange
+			if clients.ordered {
+				clientRange = &clients
+			}
+			var bounded pendingBoundedPass
+			bounded, err = scanPendingGroupsBounded(b.scanner(), known, b.remaining, nil, false, nil, clientRange)
+			result = bounded.pendingPass
+			result.pending += bounded.permanent
+		}
 		if err != nil {
+			if err == ErrInvalidUpdate {
+				return err
+			}
 			return wrapUpdateErr(err)
 		}
 		if result.pending <= b.remaining {
@@ -85,7 +102,7 @@ func (b *pendingBudget) check(count int) error {
 		if err != nil {
 			return wrapUpdateErr(err)
 		}
-		filtered, err := scanPendingGroupsBounded(b.scanner(), known, b.remaining, nil, false, bounds)
+		filtered, err := scanPendingGroupsBounded(b.scanner(), known, b.remaining, nil, false, bounds, nil)
 		if err != nil {
 			return wrapUpdateErr(err)
 		}
@@ -94,7 +111,7 @@ func (b *pendingBudget) check(count int) error {
 	// The validated head count bounds this allocation. Exact capacity avoids
 	// keeping successive large backing arrays alive on fragmented updates.
 	groups := make([]pendingGroup, 0, heads)
-	result, err := scanPendingGroupsBounded(b.scanner(), known, b.remaining, groups, true, bounds)
+	result, err := scanPendingGroupsBounded(b.scanner(), known, b.remaining, groups, true, bounds, nil)
 	if err != nil {
 		return wrapUpdateErr(err)
 	}
@@ -121,6 +138,61 @@ func (b *pendingBudget) check(count int) error {
 	}
 	b.checked = true
 	return nil
+}
+
+// Strict wire ordering proves that each client occurs in only one group.
+// Its endpoints and first gap rule out absent clients without an index.
+// Non-monotonic or repeated clients require the full bounds check instead.
+type pendingClientRange struct {
+	min, max, previous ClientID
+	gapMin, gapMax     ClientID
+	descending         bool
+	ordered            bool
+}
+
+func (r *pendingClientRange) add(client ClientID, first bool) {
+	if first {
+		r.min, r.max, r.previous, r.ordered = client, client, client, true
+		return
+	}
+	if !r.ordered {
+		return
+	}
+	if r.min == r.max {
+		r.descending = client < r.previous
+	}
+	if r.descending {
+		if client >= r.previous {
+			r.ordered = false
+			return
+		}
+		if r.gapMax == 0 && r.previous-client > 1 {
+			r.gapMin, r.gapMax = client+1, r.previous-1
+		}
+		r.min = client
+	} else {
+		if client <= r.previous {
+			r.ordered = false
+			return
+		}
+		if r.gapMax == 0 && client-r.previous > 1 {
+			r.gapMin, r.gapMax = r.previous+1, client-1
+		}
+		r.max = client
+	}
+	r.previous = client
+}
+
+func (r *pendingClientRange) headImpossible(known StateVector, client ClientID, clock uint64, deps []ID) bool {
+	if clock > known.Clock(client) {
+		return true // A unique group cannot supply its preceding clock gap.
+	}
+	for _, dep := range deps {
+		if (dep.Client < r.min || dep.Client > r.max || r.gapMax != 0 && dep.Client >= r.gapMin && dep.Client <= r.gapMax) && dep.Clock >= known.Clock(dep.Client) {
+			return true
+		}
+	}
+	return false
 }
 
 // Bounds are sorted by client, retaining duplicate entries so classification
@@ -316,8 +388,8 @@ type pendingBoundedPass struct {
 	permanent int
 }
 
-func scanPendingGroups(s *pendingScanner, known StateVector, remaining int, groups []pendingGroup, collect bool) (pendingPass, error) {
-	result := pendingPass{groups: groups}
+func scanPendingGroups(s *pendingScanner, known StateVector, remaining int, clientRange *pendingClientRange) (pendingPass, error) {
+	var result pendingPass
 	clients := s.uint()
 	if clients > maxV2Items {
 		return result, ErrInvalidUpdate
@@ -330,22 +402,29 @@ func scanPendingGroups(s *pendingScanner, known StateVector, remaining int, grou
 			return result, ErrInvalidUpdate
 		}
 		client, clock := s.client(), s.uint()
-		blocked := false
+		if clientRange != nil {
+			clientRange.add(client, i == 0)
+		}
+		knownClock := known.Clock(client)
 		for j := uint64(0); j < n && s.err == nil; j++ {
 			length, skip, deps, numDeps := s.item()
 			end := clock + length
 			if end < clock {
 				return result, ErrInvalidUpdate
 			}
-			if !skip && end > known.Clock(client) {
-				ready := clock <= known.Clock(client)
-				for _, dep := range deps[:numDeps] {
-					if dep.Clock >= known.Clock(dep.Client) {
-						ready = false
+			if !skip && end > knownClock {
+				ready := clock <= knownClock
+				if ready {
+					for _, dep := range deps[:numDeps] {
+						if dep.Clock >= known.Clock(dep.Client) {
+							ready = false
+							break
+						}
 					}
 				}
 				if ready {
 					known[client] = end
+					knownClock = end
 					result.progressed = true
 				} else {
 					result.pending++
@@ -353,17 +432,6 @@ func scanPendingGroups(s *pendingScanner, known StateVector, remaining int, grou
 						// No other group can fill this group's first blocked head. All
 						// following uncovered non-Skip structs remain permanently pending.
 						return result, ErrInvalidUpdate
-					}
-					if !blocked {
-						result.heads++
-						if collect {
-							group := pendingGroup{client: client, clock: clock, end: end, deps: deps, numDeps: numDeps, remaining: n - j - 1}
-							if group.remaining > 0 {
-								group.cursor = s.checkpoint()
-							}
-							result.groups = append(result.groups, group)
-						}
-						blocked = true
 					}
 				}
 			}
@@ -373,7 +441,7 @@ func scanPendingGroups(s *pendingScanner, known StateVector, remaining int, grou
 	return result, s.err
 }
 
-func scanPendingGroupsBounded(s *pendingScanner, known StateVector, remaining int, groups []pendingGroup, collect bool, bounds []pendingWireBound) (pendingBoundedPass, error) {
+func scanPendingGroupsBounded(s *pendingScanner, known StateVector, remaining int, groups []pendingGroup, collect bool, bounds []pendingWireBound, clientRange *pendingClientRange) (pendingBoundedPass, error) {
 	result := pendingBoundedPass{pendingPass: pendingPass{groups: groups}}
 	clients := s.uint()
 	if clients > maxV2Items {
@@ -388,15 +456,20 @@ func scanPendingGroupsBounded(s *pendingScanner, known StateVector, remaining in
 		}
 		client, clock := s.client(), s.uint()
 		blocked, permanent := false, false
+		knownClock := known.Clock(client)
 		for j := uint64(0); j < n && s.err == nil; j++ {
 			length, skip, deps, numDeps := s.item()
 			end := clock + length
 			if end < clock {
 				return result, ErrInvalidUpdate
 			}
-			if !skip && end > known.Clock(client) {
-				if !blocked && bounds != nil {
-					permanent = pendingHeadImpossible(bounds, known, client, clock, deps[:numDeps])
+			if !skip && end > knownClock {
+				if !blocked {
+					if clientRange != nil {
+						permanent = clientRange.headImpossible(known, client, clock, deps[:numDeps])
+					} else if bounds != nil {
+						permanent = pendingHeadImpossible(bounds, known, client, clock, deps[:numDeps])
+					}
 				}
 				if permanent {
 					result.permanent++
@@ -407,14 +480,18 @@ func scanPendingGroupsBounded(s *pendingScanner, known StateVector, remaining in
 					clock = end
 					continue
 				}
-				ready := clock <= known.Clock(client)
-				for _, dep := range deps[:numDeps] {
-					if dep.Clock >= known.Clock(dep.Client) {
-						ready = false
+				ready := clock <= knownClock
+				if ready {
+					for _, dep := range deps[:numDeps] {
+						if dep.Clock >= known.Clock(dep.Client) {
+							ready = false
+							break
+						}
 					}
 				}
 				if ready {
 					known[client] = end
+					knownClock = end
 					result.progressed = true
 				} else {
 					result.pending++
