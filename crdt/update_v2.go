@@ -799,10 +799,7 @@ func applyV2Txn(txn *Transaction, update []byte) (retErr error) {
 	// pendingDs may be drainable even if pending items aren't — integrated
 	// items from this update might be targets of previously-parked deletes.
 	if len(txn.doc.store.pendingDs.clients) > 0 {
-		pendingDs := txn.doc.store.pendingDs
-		txn.doc.store.pendingDs = newDeleteSet()
-		stillUnresolvable := pendingDs.applyToPartial(txn)
-		txn.doc.store.pendingDs = stillUnresolvable
+		retryPendingDs(txn)
 	}
 
 	// Drain pending items whose dependencies have been satisfied by
@@ -861,10 +858,7 @@ func applyV2Txn(txn *Transaction, update []byte) (retErr error) {
 		// Retry pendingDs — freshly-integrated items may now be targets
 		// of previously-parked delete entries.
 		if progressed && len(txn.doc.store.pendingDs.clients) > 0 {
-			pendingDs := txn.doc.store.pendingDs
-			txn.doc.store.pendingDs = newDeleteSet()
-			stillUnresolvable := pendingDs.applyToPartial(txn)
-			txn.doc.store.pendingDs = stillUnresolvable
+			retryPendingDs(txn)
 		}
 		if !progressed {
 			// No progress this pass — infinite-loop guard. Items remain parked.
@@ -1175,7 +1169,7 @@ func decodeTypeContentV2(dec *v2Decoder, doc *Doc, typeRef byte) (*abstractType,
 }
 
 func decodeDeleteSetV2(dec *v2Decoder) (DeleteSet, error) {
-	ds := newDeleteSet()
+	ds := newOrderedDeleteSet()
 	n, err := dec.restDec.ReadVarUint()
 	if err != nil {
 		return ds, err
@@ -1205,6 +1199,9 @@ func decodeDeleteSetV2(dec *v2Decoder) (DeleteSet, error) {
 			length, err := dec.readDsLen()
 			if err != nil {
 				return ds, err
+			}
+			if _, seen := ds.clients[client]; !seen {
+				ds.order = append(ds.order, client) // Yjs applies a delete set in its encoded order
 			}
 			ds.clients[client] = append(ds.clients[client], DeleteRange{Clock: clock, Len: length})
 		}

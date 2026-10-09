@@ -47,6 +47,9 @@ func EncodeStateAsUpdateV1(doc *Doc, sv StateVector) []byte {
 }
 
 // ApplyUpdateV1 decodes and integrates a V1 binary update into doc.
+// When it changes formatted text, a local transaction with a nil origin may
+// follow it, once its observers have fired, to clean up the format markers it
+// left redundant, as in Yjs, with its own update and observer callbacks.
 func ApplyUpdateV1(doc *Doc, update []byte, origin any) error {
 	var applyErr error
 	doc.Transact(func(txn *Transaction) {
@@ -95,6 +98,9 @@ func withParked(doc *Doc, sv StateVector, state []byte,
 }
 
 // ApplyUpdateV2 decodes and integrates a Yjs V2 binary update into doc.
+// When it changes formatted text, a local transaction with a nil origin may
+// follow it, once its observers have fired, to clean up the format markers it
+// left redundant, as in Yjs, with its own update and observer callbacks.
 func ApplyUpdateV2(doc *Doc, update []byte, origin any) error {
 	var applyErr error
 	doc.Transact(func(txn *Transaction) {
@@ -465,7 +471,9 @@ func encodeDeleteSet(enc *encoding.Encoder, ds DeleteSet) {
 	for c := range ds.clients {
 		clients = append(clients, c)
 	}
-	sort.Slice(clients, func(i, j int) bool { return clients[i] < clients[j] })
+	// Yjs writes delete set clients in descending order, and applies a delete
+	// set in its encoded order.
+	sort.Slice(clients, func(i, j int) bool { return clients[i] > clients[j] })
 	enc.WriteVarUint(uint64(len(clients)))
 	for _, c := range clients {
 		ranges := ds.clients[c]
@@ -717,10 +725,7 @@ func drainPending(txn *Transaction) {
 	// pendingDs may be drainable even if pending items aren't — integrated
 	// items from this update might be targets of previously-parked deletes.
 	if len(txn.doc.store.pendingDs.clients) > 0 {
-		pending := txn.doc.store.pendingDs
-		txn.doc.store.pendingDs = newDeleteSet()
-		stillUnresolvable := pending.applyToPartial(txn)
-		txn.doc.store.pendingDs = stillUnresolvable
+		retryPendingDs(txn)
 	}
 
 	// Drain pending items whose dependencies have been satisfied by
@@ -779,10 +784,7 @@ func drainPending(txn *Transaction) {
 		// Retry pendingDs — freshly-integrated items may now be targets
 		// of previously-parked delete entries.
 		if progressed && len(txn.doc.store.pendingDs.clients) > 0 {
-			pending := txn.doc.store.pendingDs
-			txn.doc.store.pendingDs = newDeleteSet()
-			stillUnresolvable := pending.applyToPartial(txn)
-			txn.doc.store.pendingDs = stillUnresolvable
+			retryPendingDs(txn)
 		}
 		if !progressed {
 			// No progress this pass — infinite-loop guard. Items remain parked.
@@ -1177,7 +1179,7 @@ func decodeTypeContent(dec *encoding.Decoder, doc *Doc, typeClass byte) (*abstra
 }
 
 func decodeDeleteSet(dec *encoding.Decoder) (DeleteSet, error) {
-	ds := newDeleteSet()
+	ds := newOrderedDeleteSet()
 	n, err := dec.ReadVarUint()
 	if err != nil {
 		return ds, err
@@ -1206,6 +1208,9 @@ func decodeDeleteSet(dec *encoding.Decoder) (DeleteSet, error) {
 			length, err := dec.ReadVarUint()
 			if err != nil {
 				return ds, err
+			}
+			if _, seen := ds.clients[client]; !seen {
+				ds.order = append(ds.order, client) // Yjs applies a delete set in its encoded order
 			}
 			ds.clients[client] = append(ds.clients[client], DeleteRange{Clock: clock, Len: length})
 		}
