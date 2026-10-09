@@ -5,6 +5,71 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.51.4] — 2026-10-09
+
+### Fixed
+
+- **`crdt`: text inserts picked up formatting yjs clears (#285).** `ApplyDelta`
+  inserts, `InsertEmbed`, and `Insert` with attributes inherited the formatting
+  around the cursor. They now clear every attribute they don't name, as yjs
+  `insertText` does; cleared and restored markers follow yjs's order. `Insert`
+  with nil or empty attributes still inherits, as yjs `insert` does with the
+  argument omitted.
+
+- **`crdt`: formatting emptied by a remote delete was never cleaned up (#284).**
+  yjs deletes format markers left covering no text after a remote transaction;
+  ygo kept them, so later text inherited stale formatting. ygo now runs the same
+  cleanup, as a local transaction with a nil origin, and only on texts yjs would
+  clean (not on a root first accessed after its markers arrived).
+
+- **`crdt`: formatted inserts dropped the right origin yjs keeps (#287).**
+
+- **`crdt`: two identical documents could clean up the same update
+  differently.** Delete sets were applied in map order. They now apply, and
+  retry when parked, in yjs's order, and V1 writes delete-set clients
+  descending like yjs and V2.
+
+### Changed
+
+- Applying a remote update to formatted text may be followed by a local,
+  nil-origin cleanup transaction with its own update and observer events. The
+  default `UndoManager` captures it, as yjs's default tracked origins do.
+- A remote update that adds formatting to a text now walks that whole text, as
+  yjs does (about 170µs per update on a 100k-character document). Plain text is
+  unaffected. A random-position `InsertEmbed` into heavily fragmented formatted
+  text costs a full walk too.
+- V1 encodings list delete-set clients in descending order. Decoders accept
+  either order.
+
+## [1.51.3] — 2026-10-08
+
+### Fixed
+
+- **`crdt`: applying an update no longer merges same-client items that were
+  inserted toward different right neighbours.** `ApplyUpdate`
+  merged adjacent, clock-contiguous items from one client without checking
+  that the right item was inserted directly after the left one and that both
+  had the same right origin, and `RunGC` merged tombstones the same way. The
+  merged item kept only the left item's right origin. A peer that received
+  the items in one apply (a late joiner, an offline client catching up, a
+  server loading a stored state) then placed the next concurrent insert inside
+  that run differently from the peers that received the items one by one, and
+  every later encoding of its state (a sync step 2, a compacted state) gave
+  the right item's characters the wrong right origin, for ygo and Yjs alike.
+  Items now merge only under Yjs's `Item.mergeWith` conditions. States that
+  were already encoded with the merged items keep the wrong right origins.
+
+## [1.51.2] — 2026-10-08
+
+### Fixed
+
+- **`crdt`: a struct parked before its root type was first accessed was lost.**
+  When an update for a root (`"t"`) arrived ahead of a dependency, its structs
+  were parked with a placeholder parent; calling `GetText("t")` (or any root
+  accessor) for the first time before the dependency arrived left them pointing
+  at the discarded placeholder, so they never appeared in the type and peers
+  diverged permanently. First access now repoints parked structs too (#290).
+
 ## [1.51.1] — 2026-10-07
 
 ### Fixed

@@ -1,3 +1,74 @@
+## v1.51.4
+
+**Who is affected:** anyone using rich text (`YText` with formatting), embeds,
+or `ApplyDelta`, especially alongside yjs clients.
+
+**Formatting now behaves like yjs.** Inserting text or an embed with attributes
+inside formatted text used to keep the surrounding formatting too; it now gets
+exactly the attributes you pass, as in yjs. `Insert` with no attributes still
+continues the formatting around it. `ApplyDelta` follows the delta exactly.
+
+**Stale formatting is cleaned up after remote deletes.** When a collaborator
+deleted all the text a format covered, ygo kept the leftover markers, so text
+typed there later came out bold or italic unexpectedly. It now removes them the
+way yjs does.
+
+**What you might notice:**
+
+- After a remote update to formatted text, you may see a second, local update
+  and observer round with a nil origin: that is the cleanup, and it is broadcast
+  like any edit. The default `UndoManager` records it, as yjs does.
+- Servers applying many remote formatting edits to very large documents do more
+  work per update (a walk of the text, as yjs does). Plain text is unaffected.
+
+**Upgrading.** No API change.
+
+## v1.51.3
+
+**Who is affected:** anyone whose documents get concurrent text inserts, once
+a peer receives several of one client's inserts in a single apply: a late
+joiner's sync step 2, an offline client catching up, a server loading a stored
+state. Any state that peer then encodes (a sync step 2 it answers, a compacted
+log, `RunGC` followed by an encode) passes the problem to every peer that
+loads it.
+
+**Concurrent inserts could end up in different places on different peers.**
+Applying an update merged adjacent items from one client into a single item
+whenever their clocks were contiguous and nothing sat between them. Yjs merges
+two items only when the right one was inserted directly after the left one and
+both were inserted toward the same right neighbour (their right origin),
+because the merged item keeps only the left item's origins. ygo did not check
+the right origins. The peer that merged them then placed the next concurrent
+insert inside that run differently from the peers that had received the items
+one at a time, and any state it encoded gave the right item's characters a
+right origin they never had, so ygo and Yjs alike decoded them elsewhere.
+`RunGC`'s tombstone merge had the same gap and could move live text whose
+origin was inside the second tombstone.
+
+Both merges now require the right item's origin to be the left item's last
+character and the two right origins to be equal, as `Item.mergeWith` does.
+Items that do not qualify stay separate, so such a document keeps a few more
+items than before.
+
+**Upgrading.** No API or wire format change. A state that an earlier version
+already encoded or compacted keeps its merged items and their wrong right
+origins: this release stops new ones from being written but does not repair
+stored ones.
+
+## v1.51.2
+
+**Who is affected:** servers and clients that call `GetText`, `GetArray`,
+`GetMap` or `GetXmlFragment` only after applying updates, for example after a
+sync step.
+
+**Edits that arrived out of order could vanish.** If an update for a document
+root arrived before an edit it depends on, and the code then accessed that root
+for the first time before the missing edit arrived, the waiting update was
+attached to a placeholder and never showed up. That peer stayed different from
+everyone else for good. Accessing a root now picks up waiting updates too.
+
+**Upgrading.** No API change.
+
 ## v1.51.1
 
 Avoid repeated prefix scans when collecting sparse transaction delete ranges. The range starts at the containing struct found by binary search; partial overlaps and tombstones retain their existing behavior.

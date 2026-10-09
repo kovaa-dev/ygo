@@ -70,6 +70,7 @@ func DecodeSnapshot(data []byte) (*Snapshot, error) {
 	if err != nil {
 		return nil, wrapUpdateErr(err)
 	}
+	ds.order = nil // a snapshot's delete set is only queried, so it matches one built from the store
 
 	n, err := dec.ReadVarUint()
 	if err != nil {
@@ -313,8 +314,11 @@ func RunGC(doc *Doc) {
 			itemCD, itemIsCD := item.Content.(*ContentDeleted)
 
 			// Merge only when both are tombstones, directly adjacent in the
-			// linked list (no gap, no interleaving items), and clocks are
-			// contiguous (prev.Clock+prev.Len == item.Clock).
+			// linked list (no gap, no interleaving items), clocks are
+			// contiguous (prev.Clock+prev.Len == item.Clock), and the merged
+			// tombstone still encodes item's position: item's Origin is prev's
+			// last clock and both share an OriginRight (Yjs Item.mergeWith).
+			// A live item whose origin is inside item moves on decode otherwise.
 			prev := func() *Item {
 				if len(kept) == 0 {
 					return nil
@@ -324,7 +328,9 @@ func RunGC(doc *Doc) {
 			if prevIsCDItem && itemIsCD &&
 				gcMergeable(prev, item) &&
 				prev.Right == item && item.Left == prev &&
-				prev.ID.Clock+uint64(prev.Content.Len()) == item.ID.Clock {
+				prev.ID.Clock+uint64(prev.Content.Len()) == item.ID.Clock &&
+				item.Origin != nil && item.Origin.Client == client && item.Origin.Clock == item.ID.Clock-1 &&
+				originIDEquals(prev.OriginRight, item.OriginRight) {
 				// Absorb item into prev: extend the tombstone length, rewire
 				// the linked list, and drop item from the store slice.
 				prevCD.length += itemCD.length
