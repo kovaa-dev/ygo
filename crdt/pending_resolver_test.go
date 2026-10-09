@@ -1,6 +1,7 @@
 package crdt
 
 import (
+	"encoding/hex"
 	"fmt"
 	"math/rand"
 	"runtime"
@@ -340,5 +341,179 @@ func TestUnit_PendingResolver_ContiguousTailsMatchReference(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// Yjs 13.6.30, client 1: capture a prefix containing a–d, then append e–f.
+// Encode the suffix against a state vector at clock 2. Delivering that suffix
+// before the prefix must trim the already received c–d when the queue drains.
+func TestUnit_PendingResolver_PartialOverlapRetry(t *testing.T) {
+	for _, tc := range []struct {
+		kind           string
+		version        int
+		prefix, suffix string
+	}{
+		{"text", 1, "0101010004010474657874046162636400", "01010102840101046364656600"},
+		{"text", 2, "00000101000001040b08746578746162636444000101000001010000", "000002410001020001840604636465660400000001010200"},
+		{"array", 1, "0101010008010561727261790477016177016277016377016400", "010101028801010477016377016477016577016600"},
+		{"array", 2, "00000101000001080705617272617905010100010401010077016177016277016377016400", "0000024100010200018801000000010401010277016377016477016577016600"},
+	} {
+		t.Run(fmt.Sprintf("%s/V%d", tc.kind, tc.version), func(t *testing.T) {
+			prefix, err := hex.DecodeString(tc.prefix)
+			require.NoError(t, err)
+			suffix, err := hex.DecodeString(tc.suffix)
+			require.NoError(t, err)
+			apply := ApplyUpdateV1
+			if tc.version == 2 {
+				apply = ApplyUpdateV2
+			}
+			doc := New(WithClientID(100))
+			defer doc.Destroy()
+			require.NoError(t, apply(doc, suffix, nil))
+			require.Zero(t, doc.StateVector().Clock(1))
+			require.Equal(t, 1, doc.PendingStats().Items)
+
+			check := func() {
+				if tc.kind == "text" {
+					require.Equal(t, "abcdef", doc.GetText("text").ToString())
+				} else {
+					require.Equal(t, []any{"a", "b", "c", "d", "e", "f"}, doc.GetArray("array").ToSlice())
+				}
+				require.Equal(t, uint64(6), doc.StateVector().Clock(1))
+				require.Zero(t, doc.PendingStats().Items)
+				var end uint64
+				for _, item := range doc.store.clients[1] {
+					require.Equal(t, end, item.ID.Clock, "stored ranges must stay contiguous without overlaps")
+					end += uint64(item.Content.Len())
+				}
+				require.Equal(t, uint64(6), end)
+			}
+			require.NoError(t, apply(doc, prefix, nil))
+			check()
+			// The same suffix is now fully covered and must be a no-op.
+			require.NoError(t, apply(doc, suffix, nil))
+			check()
+		})
+	}
+}
+
+// Yjs 13.6.30: client 1 creates a nested text containing a–d (clocks 0..5).
+// A peer deletes and GCs that container while client 1 appends e–f. The suffix
+// at clock 3 arrives before the GC prefix; its parent is gone when it retries.
+// The later update writes "ok" to a different root at clocks 7..9.
+func TestUnit_PendingResolver_OrphanPartialOverlapSurvivesRestore(t *testing.T) {
+	for _, tc := range []struct {
+		version               int
+		prefix, suffix, later string
+	}{
+		{1, "01020100210104726f6f74066e65737465640100040101010005", "01010103840102046364656600", "010101070401056c61746572026f6b00"},
+		{2, "000001010000032100000d0a726f6f746e657374656404060101000201040102000101010004", "000002410001040001840604636465660400000001010300", "00000101000001040a076c617465726f6b05020101000001010700"},
+	} {
+		t.Run(fmt.Sprintf("V%d", tc.version), func(t *testing.T) {
+			prefix, err := hex.DecodeString(tc.prefix)
+			require.NoError(t, err)
+			suffix, err := hex.DecodeString(tc.suffix)
+			require.NoError(t, err)
+			later, err := hex.DecodeString(tc.later)
+			require.NoError(t, err)
+			apply := ApplyUpdateV1
+			if tc.version == 2 {
+				apply = ApplyUpdateV2
+			}
+			doc := New(WithClientID(100))
+			defer doc.Destroy()
+			require.NoError(t, apply(doc, suffix, nil))
+			require.Equal(t, 1, doc.PendingStats().Items)
+			require.NoError(t, apply(doc, prefix, nil))
+			require.Empty(t, doc.GetMap("root").Entries())
+			require.Zero(t, doc.PendingStats().Items)
+			require.Equal(t, uint64(7), doc.StateVector().Clock(1))
+			var end uint64
+			for _, item := range doc.store.clients[1] {
+				require.Equal(t, end, item.ID.Clock, "orphan ranges must stay contiguous without overlaps")
+				end += uint64(item.Content.Len())
+			}
+			require.Equal(t, uint64(7), end)
+			for _, version := range []int{1, 2} {
+				t.Run(fmt.Sprintf("restore/V%d", version), func(t *testing.T) {
+					encode, restore := EncodeStateAsUpdateV1, ApplyUpdateV1
+					if version == 2 {
+						encode, restore = EncodeStateAsUpdateV2, ApplyUpdateV2
+					}
+					restored := New(WithClientID(101))
+					defer restored.Destroy()
+					require.NoError(t, restore(restored, encode(doc, nil), nil))
+					require.Equal(t, doc.StateVector(), restored.StateVector())
+					require.NoError(t, apply(restored, later, nil))
+					require.Equal(t, "ok", restored.GetText("later").ToString())
+					require.Equal(t, uint64(9), restored.StateVector().Clock(1))
+					require.Zero(t, restored.PendingStats().Items)
+				})
+			}
+		})
+	}
+}
+
+// Overlapping copies must preserve content, clocks and events while selecting
+// the long producer containing a dependency inside its wire range.
+func TestUnit_PendingResolver_OverlappingRangesMatchFixedPoint(t *testing.T) {
+	const n = 128
+	for seed := int64(0); seed < 8; seed++ {
+		t.Run(fmt.Sprint(seed), func(t *testing.T) {
+			docs := []*Doc{New(WithClientID(100001)), New(WithClientID(100001))}
+			var events [2][]string
+			for which, doc := range docs {
+				text := doc.GetText("text")
+				text.Observe(func(event YTextEvent) { events[which] = append(events[which], fmt.Sprintf("%#v", event.Delta)) })
+				pending := make([]*Item, 0, 3*n)
+				for i := 0; i < n; i++ {
+					client := ClientID(i + 1)
+					value := fmt.Sprintf("%03d|", i+1)
+					var parent *abstractType
+					var origin *ID
+					if i+1 < n {
+						origin = &ID{Client: client + 1, Clock: 3}
+					} else {
+						parent = &text.abstractType
+					}
+					pending = append(pending,
+						&Item{ID: ID{Client: client}, Parent: parent, Origin: origin, Content: NewContentString(value)},
+						&Item{ID: ID{Client: client, Clock: 1}, Origin: &ID{Client: client}, Content: NewContentString(value[1:2])},
+						&Item{ID: ID{Client: client, Clock: 2}, Origin: &ID{Client: client, Clock: 1}, Content: NewContentString(value[2:])})
+				}
+				rand.New(rand.NewSource(seed)).Shuffle(len(pending), func(i, j int) { pending[i], pending[j] = pending[j], pending[i] })
+				var err error
+				doc.Transact(func(txn *Transaction) {
+					if which == 0 {
+						err = resolveWithinUpdatePending(txn, pending)
+						return
+					}
+					for len(pending) > 0 {
+						remaining := retryWithinUpdatePending(txn, pending)
+						if len(remaining) == len(pending) {
+							err = parkWithinUpdatePending(txn, remaining)
+							return
+						}
+						pending = remaining
+					}
+				})
+				require.NoError(t, err)
+			}
+			var want strings.Builder
+			for i := n; i > 0; i-- {
+				fmt.Fprintf(&want, "%03d|", i)
+			}
+			require.Equal(t, want.String(), docs[0].GetText("text").ToString())
+			require.Equal(t, docs[0].GetText("text").ToString(), docs[1].GetText("text").ToString())
+			require.Equal(t, docs[0].StateVector(), docs[1].StateVector())
+			require.Zero(t, docs[0].PendingStats().Items)
+			require.Equal(t, docs[0].PendingStats(), docs[1].PendingStats())
+			require.Equal(t, events[0], events[1])
+			require.Equal(t, EncodeStateAsUpdateV1(docs[0], nil), EncodeStateAsUpdateV1(docs[1], nil))
+			require.Equal(t, EncodeStateAsUpdateV2(docs[0], nil), EncodeStateAsUpdateV2(docs[1], nil))
+			for _, doc := range docs {
+				doc.Destroy()
+			}
+		})
 	}
 }

@@ -150,3 +150,36 @@ func TestUnit_PendingResolver_CoveredItemWithMissingOrigin(t *testing.T) {
 	require.Equal(t, uint64(1), doc.StateVector().Clock(1))
 	require.Zero(t, doc.PendingStats().Items)
 }
+
+// A shorter overlapping copy must not hide the range containing a dependency.
+// Length queries bound retry work independently of wall-clock benchmark noise.
+func TestUnit_PendingResolver_OverlappingRangesBoundWork(t *testing.T) {
+	const n = 512
+	doc := New(WithClientID(100001))
+	defer doc.Destroy()
+	root := doc.GetMap("root")
+	work := resolverWork{}
+	pending := make([]*Item, 0, 2*n)
+	for i := 0; i < n; i++ {
+		client := ClientID(i + 1)
+		var origin *ID
+		var parent *abstractType
+		if i+1 < n {
+			origin = &ID{Client: client + 1, Clock: 2}
+		} else {
+			parent = &root.abstractType
+		}
+		pending = append(pending,
+			&Item{ID: ID{Client: client}, Parent: parent, Origin: origin, Content: &resolverWorkContent{NewContentDeleted(3), &work}},
+			&Item{ID: ID{Client: client, Clock: 1}, Parent: parent, Origin: origin, Content: &resolverWorkContent{NewContentDeleted(1), &work}})
+	}
+	var err error
+	doc.Transact(func(txn *Transaction) { err = resolveWithinUpdatePending(txn, pending) })
+	require.NoError(t, err)
+	require.Zero(t, doc.PendingStats().Items)
+	require.Len(t, doc.StateVector(), n)
+	for _, clock := range doc.StateVector() {
+		require.Equal(t, uint64(3), clock)
+	}
+	require.LessOrEqual(t, work.lengths, 32*len(pending), "overlapping copies must not cause quadratic retries")
+}

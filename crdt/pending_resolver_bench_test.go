@@ -112,7 +112,7 @@ func BenchmarkPendingMultiStructChain(b *testing.B) {
 }
 
 // Overlapping short ranges cannot cover the predecessor clock in the long
-// ranges. Both copies must remain safe when the producer lookup falls back.
+// ranges. The coverage index must still select the longer producer.
 func resolverOverlapQueue(doc *Doc, n int) []*Item {
 	text := doc.GetText("text")
 	pending := make([]*Item, 0, 2*n)

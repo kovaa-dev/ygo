@@ -50,7 +50,7 @@ func indexPendingProducers(pending []*Item) []pendingProducer {
 	return order
 }
 
-// findPendingProducer returns a range candidate; overlaps fall back to retries.
+// findPendingProducer returns a candidate from the sorted producer coverage index.
 func findPendingProducer(order []pendingProducer, id ID) int {
 	i := sort.Search(len(order), func(i int) bool {
 		return order[i].id.Client > id.Client || order[i].id.Client == id.Client && order[i].id.Clock > id.Clock
@@ -78,11 +78,19 @@ func pendingClientSuccessors(order []pendingProducer) []int {
 }
 
 // resolvePendingDependencies walks producers before their dependents. Immutable
-// ranges keep searches valid when GC integration trims an Item. Unresolvable or
-// overlapping ranges remain for the ordinary fixed-point resolver.
+// ranges keep searches valid when integration trims an Item. Remaining blocked
+// items are retained for the ordinary fixed-point resolver.
 func resolvePendingDependencies(txn *Transaction, pending []*Item) []*Item {
 	order := indexPendingProducers(pending)
 	successors := pendingClientSuccessors(order)
+	// Keep the original successor links, then reuse the index for prefix coverage.
+	// A shorter overlapping range must not hide an earlier covering producer.
+	for i := 1; i < len(order); i++ {
+		previous, current := order[i-1], &order[i]
+		if previous.id.Client == current.id.Client && previous.end > current.end {
+			current.end, current.index = previous.end, previous.index
+		}
+	}
 	state := make([]byte, len(pending))
 	stack := make([]int, 0, len(pending))
 	for start := range pending {

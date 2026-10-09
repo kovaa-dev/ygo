@@ -1453,6 +1453,11 @@ func tryIntegrate(txn *Transaction, item *Item) bool {
 			// container/origin was deleted and GC'd). Yjs drops it on every
 			// peer; do NOT graft it onto an arbitrary map by scanning the store,
 			// which diverges by integration order (#156). Orphan-store it.
+			// Its same-client prefix may have arrived while this item was parked.
+			if offset := int(existingEnd - item.ID.Clock); offset > 0 {
+				item.ID.Clock += uint64(offset)
+				item.Content = item.Content.Splice(offset)
+			}
 			store.Append(item)
 			return true
 		}
@@ -1494,7 +1499,8 @@ func tryIntegrate(txn *Transaction, item *Item) bool {
 		item.Left = store.getItemCleanEnd(txn, item.Origin.Client, item.Origin.Clock)
 	}
 
-	item.integrate(txn, 0)
+	// A parked range may now overlap the store; integrate only its new suffix.
+	item.integrate(txn, int(existingEnd-item.ID.Clock))
 	return true
 }
 
