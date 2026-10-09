@@ -12,9 +12,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Resolve dependencies in complete V1/V2 checkpoints before applying the
   cross-update pending limit. Preflight retains one blocked head and a decoder
   cursor per wire group, preventing large per-struct metadata allocations on
-  incomplete updates. V2 cursors share immutable column data; single-group
-  updates reject oversized blocked tails early. Rejected preflight updates
-  add no deferred items to the persistent pending queue, retain previously
+  incomplete updates. Unique-client groups with unfillable clock gaps or
+  dependencies outside both the update and store are counted without cursors.
+  V2 cursors share immutable column data; single-group updates reject oversized
+  blocked tails early. Rejected preflight updates add no deferred items to the persistent pending queue, retain previously
   queued items, and do not roll back changes already integrated. The pending
   limit, wire format and public API are unchanged.
 

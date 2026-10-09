@@ -3,6 +3,7 @@ package crdt
 import (
 	"bytes"
 	"encoding/json"
+	"sort"
 	"strconv"
 	"unicode/utf8"
 
@@ -74,10 +75,26 @@ func (b *pendingBudget) check(count int) error {
 		}
 		heads = result.heads
 	}
+	// An absent dependency cannot be supplied by a later scan. Record compact
+	// wire bounds before retaining cursors; overlapping groups remain eligible
+	// because another group may cover a head despite its missing dependency.
+	var bounds []pendingWireBound
+	if !b.wireContainsDependencies(known) {
+		var err error
+		bounds, err = pendingWireBounds(b.scanner())
+		if err != nil {
+			return wrapUpdateErr(err)
+		}
+		filtered, err := scanPendingGroupsBounded(b.scanner(), known, b.remaining, nil, false, bounds)
+		if err != nil {
+			return wrapUpdateErr(err)
+		}
+		heads = filtered.heads
+	}
 	// The validated head count bounds this allocation. Exact capacity avoids
 	// keeping successive large backing arrays alive on fragmented updates.
 	groups := make([]pendingGroup, 0, heads)
-	result, err := scanPendingGroups(b.scanner(), known, b.remaining, groups, true)
+	result, err := scanPendingGroupsBounded(b.scanner(), known, b.remaining, groups, true, bounds)
 	if err != nil {
 		return wrapUpdateErr(err)
 	}
@@ -86,7 +103,7 @@ func (b *pendingBudget) check(count int) error {
 		if err := resolvePendingGroups(groups, known); err != nil {
 			return wrapUpdateErr(err)
 		}
-		pending := 0
+		pending := result.permanent
 		for i := range groups {
 			g := &groups[i]
 			for !g.done {
@@ -106,10 +123,197 @@ func (b *pendingBudget) check(count int) error {
 	return nil
 }
 
+// Bounds are sorted by client, retaining duplicate entries so classification
+// can distinguish a unique wire group from overlapping groups without a map.
+type pendingWireBound struct {
+	client ClientID
+	end    uint64
+}
+
+func pendingWireBounds(s *pendingScanner) ([]pendingWireBound, error) {
+	n := s.uint()
+	if n > maxV2Items {
+		return nil, ErrInvalidUpdate
+	}
+	bounds := make([]pendingWireBound, 0, int(n))
+	var total uint64
+	for i := uint64(0); i < n && s.err == nil; i++ {
+		items := s.uint()
+		total += items
+		if total > maxV2Items {
+			return nil, ErrInvalidUpdate
+		}
+		client, clock := s.client(), s.uint()
+		for j := uint64(0); j < items && s.err == nil; j++ {
+			length, _, _, _ := s.item()
+			end := clock + length
+			if end < clock {
+				return nil, ErrInvalidUpdate
+			}
+			clock = end
+		}
+		bounds = append(bounds, pendingWireBound{client: client, end: clock})
+	}
+	if s.err != nil {
+		return nil, s.err
+	}
+	sort.Slice(bounds, func(i, j int) bool {
+		if bounds[i].client != bounds[j].client {
+			return bounds[i].client < bounds[j].client
+		}
+		return bounds[i].end > bounds[j].end
+	})
+	return bounds, nil
+}
+
+func pendingHeadImpossible(bounds []pendingWireBound, known StateVector, client ClientID, clock uint64, deps []ID) bool {
+	i := sort.Search(len(bounds), func(i int) bool { return bounds[i].client >= client })
+	if i+1 < len(bounds) && bounds[i+1].client == client {
+		return false // Another group can cover this head.
+	}
+	if clock > known.Clock(client) {
+		return true // The only group cannot fill its own preceding clock gap.
+	}
+	for _, dep := range deps {
+		if dep.Clock < known.Clock(dep.Client) {
+			continue
+		}
+		i := sort.Search(len(bounds), func(i int) bool { return bounds[i].client >= dep.Client })
+		if i == len(bounds) || bounds[i].client != dep.Client || dep.Clock >= bounds[i].end {
+			return true
+		}
+	}
+	return false
+}
+
+// A contiguous, strictly ordered client range with contiguous structs and
+// references below every group's end needs no per-client bound index. This
+// covers ordinary checkpoints and reverse chains without an extra allocation.
+type pendingWireSummary struct {
+	clients, minClient, maxClient uint64
+	minDep, maxDep, maxDepClock   uint64
+	minEnd                        uint64
+	possibleMin, possibleMax      uint64
+	previous                      ClientID
+	direction                     int
+	contiguous                    bool
+}
+
+func (w pendingWireSummary) containsDependencies() bool {
+	return w.contiguous && w.clients > 0 && w.maxClient-w.minClient == w.clients-1 &&
+		w.minDep >= w.minClient && w.maxDep <= w.maxClient && w.maxDepClock < w.minEnd
+}
+
+// The census never retains cursors. Keep its decoder copies on the stack so
+// the extra wire pass does not add allocations to complete checkpoints.
+func (b *pendingBudget) wireContainsDependencies(known StateVector) bool {
+	if b.v2Start == nil {
+		if b.v2 {
+			return pendingWireContainsDependencies(newPendingScanner(b.update, true), known)
+		}
+		rest := encoding.NewDecoder(b.update)
+		s := pendingScanner{rest: rest}
+		return pendingWireContainsDependencies(&s, known)
+	}
+	v2, rest := *b.v2Start, b.v2Rest
+	// The census uses only V2 column methods. Raw fields go through s.rest;
+	// no full V2 decoder rest cursor is needed or retained here.
+	v2.restDec = nil
+	s := pendingScanner{v2: &v2, rest: &rest}
+	return pendingWireContainsDependencies(&s, known)
+}
+
+// This census runs only after both plain scans made progress. Impossible
+// dense-range proofs stop immediately; rejected tails keep the plain scan cost.
+// An unproven census falls back to the validating bounds scan. Returning only
+// the proof keeps decoder copies from escaping through an error interface.
+func pendingWireContainsDependencies(s *pendingScanner, known StateVector) bool {
+	clients := s.uint()
+	if clients == 0 {
+		return false
+	}
+	if clients > maxV2Items {
+		return false
+	}
+	w := pendingWireSummary{clients: clients, minClient: ^uint64(0), minDep: ^uint64(0), minEnd: ^uint64(0), contiguous: true}
+	var total uint64
+	for i := uint64(0); i < clients; i++ {
+		n := s.uint()
+		if n > maxV2Items-total {
+			return false
+		}
+		total += n
+		client, clock := s.client(), s.uint()
+		if s.err != nil {
+			return false
+		}
+		w.minClient = min(w.minClient, uint64(client))
+		w.maxClient = max(w.maxClient, uint64(client))
+		if i == 0 {
+			distance := clients - 1
+			if uint64(client) >= distance {
+				w.possibleMin = uint64(client) - distance
+			}
+			w.possibleMax = ^uint64(0)
+			if uint64(client) <= ^uint64(0)-distance {
+				w.possibleMax = uint64(client) + distance
+			}
+		}
+		if clock > known.Clock(client) {
+			return false
+		}
+		if i > 0 {
+			direction := -1
+			if client > w.previous {
+				direction = 1
+			}
+			if client == w.previous || (i > 1 && direction != w.direction) ||
+				(client > w.previous && client-w.previous != 1) ||
+				(client < w.previous && w.previous-client != 1) {
+				return false
+			}
+			w.direction = direction
+		}
+		w.previous = client
+		for j := uint64(0); j < n; j++ {
+			length, skip, deps, numDeps := s.item()
+			if s.err != nil {
+				return false
+			}
+			end := clock + length
+			if end < clock {
+				return false
+			}
+			if skip {
+				return false
+			}
+			for _, dep := range deps[:numDeps] {
+				if uint64(dep.Client) < w.possibleMin || uint64(dep.Client) > w.possibleMax {
+					return false
+				}
+				w.minDep = min(w.minDep, uint64(dep.Client))
+				w.maxDep = max(w.maxDep, uint64(dep.Client))
+				w.maxDepClock = max(w.maxDepClock, dep.Clock)
+			}
+			clock = end
+		}
+		w.minEnd = min(w.minEnd, clock)
+		if w.maxDepClock >= w.minEnd {
+			return false
+		}
+	}
+	return w.containsDependencies()
+}
+
 type pendingPass struct {
 	groups         []pendingGroup
 	heads, pending int
 	progressed     bool
+}
+
+type pendingBoundedPass struct {
+	pendingPass
+	permanent int
 }
 
 func scanPendingGroups(s *pendingScanner, known StateVector, remaining int, groups []pendingGroup, collect bool) (pendingPass, error) {
@@ -134,6 +338,75 @@ func scanPendingGroups(s *pendingScanner, known StateVector, remaining int, grou
 				return result, ErrInvalidUpdate
 			}
 			if !skip && end > known.Clock(client) {
+				ready := clock <= known.Clock(client)
+				for _, dep := range deps[:numDeps] {
+					if dep.Clock >= known.Clock(dep.Client) {
+						ready = false
+					}
+				}
+				if ready {
+					known[client] = end
+					result.progressed = true
+				} else {
+					result.pending++
+					if clients == 1 && result.pending > remaining {
+						// No other group can fill this group's first blocked head. All
+						// following uncovered non-Skip structs remain permanently pending.
+						return result, ErrInvalidUpdate
+					}
+					if !blocked {
+						result.heads++
+						if collect {
+							group := pendingGroup{client: client, clock: clock, end: end, deps: deps, numDeps: numDeps, remaining: n - j - 1}
+							if group.remaining > 0 {
+								group.cursor = s.checkpoint()
+							}
+							result.groups = append(result.groups, group)
+						}
+						blocked = true
+					}
+				}
+			}
+			clock = end
+		}
+	}
+	return result, s.err
+}
+
+func scanPendingGroupsBounded(s *pendingScanner, known StateVector, remaining int, groups []pendingGroup, collect bool, bounds []pendingWireBound) (pendingBoundedPass, error) {
+	result := pendingBoundedPass{pendingPass: pendingPass{groups: groups}}
+	clients := s.uint()
+	if clients > maxV2Items {
+		return result, ErrInvalidUpdate
+	}
+	var total uint64
+	for i := uint64(0); i < clients && s.err == nil; i++ {
+		n := s.uint()
+		total += n
+		if total > maxV2Items {
+			return result, ErrInvalidUpdate
+		}
+		client, clock := s.client(), s.uint()
+		blocked, permanent := false, false
+		for j := uint64(0); j < n && s.err == nil; j++ {
+			length, skip, deps, numDeps := s.item()
+			end := clock + length
+			if end < clock {
+				return result, ErrInvalidUpdate
+			}
+			if !skip && end > known.Clock(client) {
+				if !blocked && bounds != nil {
+					permanent = pendingHeadImpossible(bounds, known, client, clock, deps[:numDeps])
+				}
+				if permanent {
+					result.permanent++
+					if result.permanent > remaining {
+						return result, ErrInvalidUpdate
+					}
+					blocked = true
+					clock = end
+					continue
+				}
 				ready := clock <= known.Clock(client)
 				for _, dep := range deps[:numDeps] {
 					if dep.Clock >= known.Clock(dep.Client) {

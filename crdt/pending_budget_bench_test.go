@@ -28,8 +28,8 @@ func BenchmarkPendingUpdateIncomplete(b *testing.B) {
 	}
 }
 
-// Varying dependencies defeated the old span compaction and allocated hundreds
-// of MiB even at a pending cap of 16. Fixture allocation is outside the timer.
+// Varying dependencies exercise metadata bounds at a pending cap of 16.
+// Fixture allocation is outside the timer.
 func BenchmarkPendingUpdateDiverseDependencies(b *testing.B) {
 	for _, version := range []int{1, 2} {
 		for _, shape := range []string{"missing", "lengths", "unrelated", "cycle", "groups", "groups-unrelated"} {

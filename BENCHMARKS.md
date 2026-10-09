@@ -315,17 +315,18 @@ better-documented parity with the Yjs reference than yrs does.
 ## Pending-budget preflight review
 
 These scenarios use `benchheavy`; sources are
-[`pending_budget_bench_test.go`](crdt/pending_budget_bench_test.go) and
-[`pending_budget_review_bench_test.go`](crdt/pending_budget_review_bench_test.go).
+[`pending_budget_bench_test.go`](crdt/pending_budget_bench_test.go),
+[`pending_budget_review_bench_test.go`](crdt/pending_budget_review_bench_test.go) and
+[`pending_cursor_bench_test.go`](crdt/pending_cursor_bench_test.go).
 
 - Reverse chains exercise V1/V2 references to later client groups.
 - Many-client checkpoints use ordinary Ygo text transactions and V2 encoding.
 - Incomplete updates cover same-parent tails and varied missing clocks,
-  content lengths, cycles and client groups.
+  content lengths, cycles and client groups, including missing-client cursor bombs.
 
 ```sh
 go test -tags benchheavy ./crdt -run '^$' \
-  -bench '^BenchmarkPending(ReverseChain|ManyClientCheckpoint|UpdateDiverseDependencies)$' \
+  -bench '^BenchmarkPending(ReverseChain|ManyClientCheckpoint|UpdateDiverseDependencies|CursorBomb)$' \
   -benchmem -benchtime=1x -count=10 -timeout=30m
 go test -tags benchheavy ./crdt -run '^$' \
   -bench '^Benchmark(ApplyUpdateV[12](_Bulk)?|PendingUpdateIncomplete)$' \
@@ -341,5 +342,3 @@ result checks; `rejections/op` distinguishes rejection from successful restore.
 Reported peak RSS uses the largest of three fresh `/usr/bin/time -l` processes
 applying identical prepared wire bytes, with a GC before destination creation.
 Runtime/input/document are included; fixture generation and build are excluded.
-Full measurements, revision comparisons and trade-offs are in
-[PR #260](https://github.com/reearth/ygo/pull/260).

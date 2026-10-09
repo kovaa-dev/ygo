@@ -674,7 +674,7 @@ func decodeAndPark(txn *Transaction, dec *encoding.Decoder, sv StateVector, numC
 // without attaching them to a root, and respects same-client clock gaps.
 // Survivors are parked in store.pending within the cross-update limit.
 // Preflight bounds unresolved items before decoding an oversized blocked tail;
-// this integration loop still uses the existing fixed-point traversal.
+// integration retries deferred items until no further progress is possible.
 // Returns ErrInvalidUpdate (wrapped) if the pending queue cap is exceeded.
 func resolveWithinUpdatePending(txn *Transaction, pending []*Item) error {
 	for len(pending) > 0 {
