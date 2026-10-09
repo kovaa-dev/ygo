@@ -5,11 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.51.6] — 2026-10-09
+
+### Performance
+
+- **`crdt`: replacing a map value no longer scans unrelated keys.** Direct
+  replacements after the previous rightmost value skip the shared-list scan.
+  Concurrent and non-adjacent replacements retain conflict resolution.
+
 ## [1.51.1] — 2026-10-07
 
 ### Fixed
-
-- Avoid scanning unrelated map keys when a replacement is placed immediately after the previous rightmost value of that key. Concurrent replacements still use the existing conflict resolution path.
 
 - **`crdt`: undo restored a deleted nested type empty.** `ContentType.Copy`
   shared the original type, whose children were all tombstoned, and

@@ -1,6 +1,11 @@
-## v1.51.1
+## v1.51.6
 
-Avoid scanning unrelated map keys when a replacement is placed immediately after the previous rightmost value of that key. Concurrent replacements still use the existing conflict resolution path.
+**Replacing a map value no longer scans unrelated keys.** Direct replacements
+skip the shared-list scan when placed immediately after the key's previous
+rightmost value. Concurrent and non-adjacent replacements retain conflict
+resolution.
+
+## v1.51.1
 
 **Who is affected:** anyone using `UndoManager` or `YArray.Move`, and anyone
 exchanging V1 updates with yjs peers that carry legacy JSON content.
