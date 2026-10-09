@@ -61,11 +61,28 @@ func findPendingProducer(order []pendingProducer, id ID) int {
 	return -1
 }
 
+// pendingClientSuccessors links contiguous ranges in the same client. Single-
+// struct client queues need no additional storage or successor lookup.
+func pendingClientSuccessors(order []pendingProducer) []int {
+	var next []int
+	for i := 1; i < len(order); i++ {
+		left, right := order[i-1], order[i]
+		if left.id.Client == right.id.Client && left.end == right.id.Clock {
+			if next == nil {
+				next = make([]int, len(order))
+			}
+			next[left.index] = right.index + 1
+		}
+	}
+	return next
+}
+
 // resolvePendingDependencies walks producers before their dependents. Immutable
 // ranges keep searches valid when GC integration trims an Item. Unresolvable or
 // overlapping ranges remain for the ordinary fixed-point resolver.
 func resolvePendingDependencies(txn *Transaction, pending []*Item) []*Item {
 	order := indexPendingProducers(pending)
+	successors := pendingClientSuccessors(order)
 	state := make([]byte, len(pending))
 	stack := make([]int, 0, len(pending))
 	for start := range pending {
@@ -80,6 +97,13 @@ func resolvePendingDependencies(txn *Transaction, pending []*Item) []*Item {
 			if tryIntegrate(txn, item) {
 				state[index] = 2
 				stack = stack[:len(stack)-1]
+				// Complete a contiguous client tail before returning to consumers.
+				// Otherwise deferred tails may scan a growing set of descendants.
+				if successors != nil {
+					if next := successors[index]; next > 0 && state[next-1] == 0 && pending[next-1].ID.Clock == txn.doc.store.NextClock(item.ID.Client) {
+						stack = append(stack, next-1)
+					}
+				}
 				continue
 			}
 			var deps [4]ID

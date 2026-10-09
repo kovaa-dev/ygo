@@ -6,6 +6,7 @@ import (
 	"sort"
 
 	"github.com/reearth/ygo/encoding"
+	"github.com/reearth/ygo/internal/anycodec"
 )
 
 // maxV2Items caps the total number of structs decoded from a single V2 update to
@@ -126,15 +127,15 @@ func (e *v2Encoder) writeDsLen(l uint64) {
 // ── V2 decoder state ──────────────────────────────────────────────────────────
 
 type v2Decoder struct {
-	keyClockDec   *encoding.IntDiffOptRleDecoder
-	clientDec     *encoding.UintOptRleDecoder
-	leftClockDec  *encoding.IntDiffOptRleDecoder
-	rightClockDec *encoding.IntDiffOptRleDecoder
-	infoDec       *encoding.RleByteDecoder
-	stringDec     *encoding.StringDecoder
-	parentInfoDec *encoding.RleByteDecoder
-	typeRefDec    *encoding.UintOptRleDecoder
-	lenDec        *encoding.UintOptRleDecoder
+	keyClockDec   anycodec.IntDiffOptRleDecoder
+	clientDec     anycodec.UintOptRleDecoder
+	leftClockDec  anycodec.IntDiffOptRleDecoder
+	rightClockDec anycodec.IntDiffOptRleDecoder
+	infoDec       anycodec.RleByteDecoder
+	stringDec     anycodec.StringDecoder
+	parentInfoDec anycodec.RleByteDecoder
+	typeRefDec    anycodec.UintOptRleDecoder
+	lenDec        anycodec.UintOptRleDecoder
 	restDec       *encoding.Decoder
 
 	keys      []string
@@ -199,21 +200,21 @@ func newV2Decoder(data []byte) (*v2Decoder, error) {
 	// Remaining bytes = restDecoder (raw, no length prefix)
 	remaining := dec.RemainingBytes()
 
-	stringDec, err := encoding.NewStringDecoder(stringBytes)
+	stringDec, err := anycodec.NewStringDecoder(stringBytes)
 	if err != nil {
 		return nil, fmt.Errorf("%w: V2 stringDecoder: %v", ErrInvalidUpdate, err)
 	}
 
 	return &v2Decoder{
-		keyClockDec:   encoding.NewIntDiffOptRleDecoder(keyClockBytes),
-		clientDec:     encoding.NewUintOptRleDecoder(clientBytes),
-		leftClockDec:  encoding.NewIntDiffOptRleDecoder(leftClockBytes),
-		rightClockDec: encoding.NewIntDiffOptRleDecoder(rightClockBytes),
-		infoDec:       encoding.NewRleByteDecoder(infoBytes),
+		keyClockDec:   anycodec.NewIntDiffOptRleDecoder(keyClockBytes),
+		clientDec:     anycodec.NewUintOptRleDecoder(clientBytes),
+		leftClockDec:  anycodec.NewIntDiffOptRleDecoder(leftClockBytes),
+		rightClockDec: anycodec.NewIntDiffOptRleDecoder(rightClockBytes),
+		infoDec:       anycodec.NewRleByteDecoder(infoBytes),
 		stringDec:     stringDec,
-		parentInfoDec: encoding.NewRleByteDecoder(parentInfoBytes),
-		typeRefDec:    encoding.NewUintOptRleDecoder(typeRefBytes),
-		lenDec:        encoding.NewUintOptRleDecoder(lenBytes),
+		parentInfoDec: anycodec.NewRleByteDecoder(parentInfoBytes),
+		typeRefDec:    anycodec.NewUintOptRleDecoder(typeRefBytes),
+		lenDec:        anycodec.NewUintOptRleDecoder(lenBytes),
 		restDec:       encoding.NewDecoder(remaining),
 	}, nil
 }
@@ -596,6 +597,10 @@ func applyV2Txn(txn *Transaction, update []byte) (retErr error) {
 	}
 
 	sv := txn.doc.store.StateVector()
+	initialV2 := *dec
+	budget := newPendingBudget(txn.doc, sv, update, true)
+	budget.v2Start = &initialV2
+	budget.v2Rest = *dec.restDec
 
 	numClients, err := dec.restDec.ReadVarUint()
 	if err != nil {
@@ -712,21 +717,14 @@ func applyV2Txn(txn *Transaction, update []byte) (retErr error) {
 				offset = int(existingEnd - clock)
 			}
 
-			// Same-client clock gap: this item's clock is past the store's
-			// current clock for this client (we have 0..existingEnd but this
-			// item starts at clock > existingEnd). Silently integrating would
-			// misplace the item at the head of its parent list. Park instead,
-			// with the store's current clock as the watermark — when the store
-			// reaches that clock, the missing predecessor may be available.
+			// A predecessor may be deferred until a later client group in this
+			// same message. Resolve the bounded update before charging items to
+			// the cross-update pending limit.
 			if clock > existingEnd {
-				if txn.doc.store.pending != nil && len(txn.doc.store.pending.items) >= txn.doc.maxPendingItemsLimit() {
-					return wrapUpdateErr(ErrInvalidUpdate)
+				pending = append(pending, item)
+				if err := budget.check(len(pending)); err != nil {
+					return err
 				}
-				if txn.doc.store.pending == nil {
-					txn.doc.store.pending = &pendingUpdate{missing: make(StateVector)}
-				}
-				txn.doc.store.pending.items = append(txn.doc.store.pending.items, item)
-				mergePendingMissing(txn.doc.store.pending.missing, client, existingEnd)
 				clock = itemEnd
 				continue
 			}
@@ -751,6 +749,9 @@ func applyV2Txn(txn *Transaction, update []byte) (retErr error) {
 			// reference to a group not yet decoded) are deferred.
 			if item.Parent == nil {
 				pending = append(pending, item)
+				if err := budget.check(len(pending)); err != nil {
+					return err
+				}
 				clock = itemEnd
 				continue
 			}
@@ -764,6 +765,9 @@ func applyV2Txn(txn *Transaction, update []byte) (retErr error) {
 			if offset == 0 && item.OriginRight != nil &&
 				item.OriginRight.Clock >= txn.doc.store.NextClock(item.OriginRight.Client) {
 				pending = append(pending, item)
+				if err := budget.check(len(pending)); err != nil {
+					return err
+				}
 				clock = itemEnd
 				continue
 			}
@@ -778,7 +782,6 @@ func applyV2Txn(txn *Transaction, update []byte) (retErr error) {
 		}
 	}
 
-	// Share the producer-first within-update resolver with V1.
 	if err := resolveWithinUpdatePending(txn, pending); err != nil {
 		return err
 	}
@@ -796,10 +799,7 @@ func applyV2Txn(txn *Transaction, update []byte) (retErr error) {
 	// pendingDs may be drainable even if pending items aren't — integrated
 	// items from this update might be targets of previously-parked deletes.
 	if len(txn.doc.store.pendingDs.clients) > 0 {
-		pendingDs := txn.doc.store.pendingDs
-		txn.doc.store.pendingDs = newDeleteSet()
-		stillUnresolvable := pendingDs.applyToPartial(txn)
-		txn.doc.store.pendingDs = stillUnresolvable
+		retryPendingDs(txn)
 	}
 
 	// Drain pending items whose dependencies have been satisfied by
@@ -858,10 +858,7 @@ func applyV2Txn(txn *Transaction, update []byte) (retErr error) {
 		// Retry pendingDs — freshly-integrated items may now be targets
 		// of previously-parked delete entries.
 		if progressed && len(txn.doc.store.pendingDs.clients) > 0 {
-			pendingDs := txn.doc.store.pendingDs
-			txn.doc.store.pendingDs = newDeleteSet()
-			stillUnresolvable := pendingDs.applyToPartial(txn)
-			txn.doc.store.pendingDs = stillUnresolvable
+			retryPendingDs(txn)
 		}
 		if !progressed {
 			// No progress this pass — infinite-loop guard. Items remain parked.
@@ -1172,7 +1169,7 @@ func decodeTypeContentV2(dec *v2Decoder, doc *Doc, typeRef byte) (*abstractType,
 }
 
 func decodeDeleteSetV2(dec *v2Decoder) (DeleteSet, error) {
-	ds := newDeleteSet()
+	ds := newOrderedDeleteSet()
 	n, err := dec.restDec.ReadVarUint()
 	if err != nil {
 		return ds, err
@@ -1202,6 +1199,9 @@ func decodeDeleteSetV2(dec *v2Decoder) (DeleteSet, error) {
 			length, err := dec.readDsLen()
 			if err != nil {
 				return ds, err
+			}
+			if _, seen := ds.clients[client]; !seen {
+				ds.order = append(ds.order, client) // Yjs applies a delete set in its encoded order
 			}
 			ds.clients[client] = append(ds.clients[client], DeleteRange{Clock: clock, Len: length})
 		}

@@ -9,7 +9,7 @@ test:
 	$(GOTEST) $(PACKAGES)
 
 coverage:
-	$(GOTEST) -coverprofile=coverage.txt -covermode=atomic $(PACKAGES)
+	go test -timeout 120s -coverprofile=coverage.txt -covermode=set $(PACKAGES)
 	go tool cover -html=coverage.txt -o coverage.html
 
 lint:
@@ -59,6 +59,7 @@ fixtures:
 	node testutil/gen_fixtures_contentjson.js
 	node testutil/gen_fixtures_multivalue.js
 	node testutil/gen_fixtures_applydelta.js
+	node testutil/gen_fixtures_textformat.js
 
 tools:
 	go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest

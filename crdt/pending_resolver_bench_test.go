@@ -3,76 +3,9 @@
 package crdt
 
 import (
-	"errors"
 	"fmt"
 	"testing"
 )
-
-// pendingManyClientCheckpoint uses ordinary text insertions and Ygo's state
-// encoder. Assigning each transaction a distinct client ID creates the fixture
-// without constructing thousands of replicas during benchmark setup.
-func pendingManyClientCheckpoint(n int) []byte {
-	doc := New()
-	defer doc.Destroy()
-	text := doc.GetText("text")
-	for i := 0; i < n; i++ {
-		doc.Transact(func(txn *Transaction) {
-			doc.clientID = ClientID(i + 1)
-			text.Insert(txn, i, "x", nil)
-		})
-	}
-	return EncodeStateAsUpdateV2(doc, nil)
-}
-
-// Report rejections separately: main's early rejection at a small pending cap
-// is not a faster successful restore. All versions receive identical fixtures
-// and options. The high-cap cases also compare successful apply on main.
-func benchmarkPendingComplete(b *testing.B, update []byte, version, n, cap int) {
-	apply := ApplyUpdateV1
-	if version == 2 {
-		apply = ApplyUpdateV2
-	}
-	b.ReportAllocs()
-	rejected := 0
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		b.StopTimer()
-		doc := New(WithMaxPendingItems(cap))
-		b.StartTimer()
-		err := apply(doc, update, nil)
-		b.StopTimer()
-		if err != nil {
-			if !errors.Is(err, ErrInvalidUpdate) {
-				b.Fatal(err)
-			}
-			rejected++
-		} else if doc.GetText("text").Len() != n || len(doc.StateVector()) != n || doc.PendingStats().Items != 0 {
-			b.Fatal("complete update did not restore all clients and text")
-		}
-		doc.Destroy()
-		b.StartTimer()
-	}
-	b.ReportMetric(float64(rejected)/float64(b.N), "rejections/op")
-}
-
-func BenchmarkPendingReverseChain(b *testing.B) {
-	for _, version := range []int{1, 2} {
-		for _, n := range []int{1000, 20000} {
-			update := pendingReverseChain(version, n)
-			for _, cap := range []int{16, n + 1} {
-				b.Run(fmt.Sprintf("V%d/n=%d/cap=%d", version, n, cap), func(b *testing.B) { benchmarkPendingComplete(b, update, version, n, cap) })
-			}
-		}
-	}
-}
-
-func BenchmarkPendingManyClientCheckpoint(b *testing.B) {
-	const n = 10000
-	update := pendingManyClientCheckpoint(n)
-	for _, cap := range []int{16, n + 1} {
-		b.Run(fmt.Sprintf("V2/n=%d/cap=%d", n, cap), func(b *testing.B) { benchmarkPendingComplete(b, update, 2, n, cap) })
-	}
-}
 
 func pendingLinearClientQueue(version, n int, complete bool) []byte {
 	source := New()
@@ -130,6 +63,141 @@ func BenchmarkPendingLinearClientQueue(b *testing.B) {
 						if !ok || len(val.(*YMap).Entries()) != n || doc.PendingStats().Items != 0 {
 							b.Fatal("complete queue changed")
 						}
+					}
+					doc.Destroy()
+					b.StartTimer()
+				}
+			})
+		}
+	}
+}
+
+func BenchmarkPendingMultiStructChain(b *testing.B) {
+	for _, version := range []int{1, 2} {
+		for _, n := range []int{1000, 20000} {
+			data := resolverMultiStructUpdate(version, n)
+			b.Run(fmt.Sprintf("V%d/n=%d/cap=16", version, n), func(b *testing.B) {
+				apply := ApplyUpdateV1
+				if version == 2 {
+					apply = ApplyUpdateV2
+				}
+				b.ReportAllocs()
+				b.ResetTimer()
+				rejected := 0
+				for i := 0; i < b.N; i++ {
+					b.StopTimer()
+					doc := New(WithMaxPendingItems(16))
+					b.StartTimer()
+					err := apply(doc, data, nil)
+					b.StopTimer()
+					if err != nil {
+						rejected++
+					} else {
+						if doc.GetText("text").Len() != 2*n || len(doc.StateVector()) != n || doc.PendingStats().Items != 0 {
+							b.Fatal("incomplete restore")
+						}
+						for _, clock := range doc.StateVector() {
+							if clock != 2 {
+								b.Fatal("client clock")
+							}
+						}
+					}
+					doc.Destroy()
+					b.StartTimer()
+				}
+				b.ReportMetric(float64(rejected)/float64(b.N), "rejections/op")
+			})
+		}
+	}
+}
+
+// Overlapping short ranges cannot cover the predecessor clock in the long
+// ranges. Both copies must remain safe when the producer lookup falls back.
+func resolverOverlapQueue(doc *Doc, n int) []*Item {
+	text := doc.GetText("text")
+	pending := make([]*Item, 0, 2*n)
+	for i := 0; i < n; i++ {
+		c := ClientID(i + 1)
+		var origin *ID
+		if i+1 < n {
+			origin = &ID{Client: c + 1, Clock: 2}
+		}
+		var parent *abstractType
+		if origin == nil {
+			parent = &text.abstractType
+		}
+		pending = append(pending,
+			&Item{ID: ID{Client: c}, Parent: parent, Origin: origin, Content: NewContentString("abc")},
+			&Item{ID: ID{Client: c, Clock: 1}, Parent: parent, Origin: origin, Content: NewContentString("b")})
+	}
+	return pending
+}
+
+func BenchmarkPendingOverlapFallback(b *testing.B) {
+	for _, n := range []int{1000, 5000} {
+		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				b.StopTimer()
+				doc := New(WithMaxPendingItems(2*n + 1))
+				pending := resolverOverlapQueue(doc, n)
+				b.StartTimer()
+				var err error
+				doc.Transact(func(txn *Transaction) { err = resolveWithinUpdatePending(txn, pending) })
+				b.StopTimer()
+				if err != nil || doc.PendingStats().Items != 0 || len(doc.StateVector()) != n || doc.GetText("text").Len() != 3*n {
+					b.Fatalf("invalid fallback: %v", err)
+				}
+				doc.Destroy()
+				b.StartTimer()
+			}
+		})
+	}
+}
+
+// Compare the same complete chain using the fixed-point reference and the
+// retry path directly, without enabling the dependency scheduler.
+func BenchmarkPendingFixedPointFallback(b *testing.B) {
+	for _, n := range []int{1000, 5000} {
+		for _, reference := range []bool{true, false} {
+			b.Run(fmt.Sprintf("n=%d/reference=%t", n, reference), func(b *testing.B) {
+				b.ReportAllocs()
+				for i := 0; i < b.N; i++ {
+					b.StopTimer()
+					doc := New(WithMaxPendingItems(n + 1))
+					text := doc.GetText("text")
+					pending := make([]*Item, n)
+					for j := 0; j < n; j++ {
+						c := ClientID(j + 1)
+						var origin *ID
+						if j+1 < n {
+							origin = &ID{Client: c + 1}
+						}
+						var parent *abstractType
+						if origin == nil {
+							parent = &text.abstractType
+						}
+						pending[j] = &Item{ID: ID{Client: c}, Parent: parent, Origin: origin, Content: NewContentString("x")}
+					}
+					b.StartTimer()
+					var err error
+					doc.Transact(func(txn *Transaction) {
+						if reference {
+							err = referenceWithinUpdatePending(txn, pending)
+							return
+						}
+						for len(pending) > 0 {
+							remaining := retryWithinUpdatePending(txn, pending)
+							if len(remaining) == len(pending) {
+								err = parkWithinUpdatePending(txn, remaining)
+								return
+							}
+							pending = remaining
+						}
+					})
+					b.StopTimer()
+					if err != nil || doc.PendingStats().Items != 0 || text.Len() != n {
+						b.Fatalf("incomplete fixed point: %v", err)
 					}
 					doc.Destroy()
 					b.StartTimer()

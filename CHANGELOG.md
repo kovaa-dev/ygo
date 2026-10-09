@@ -5,17 +5,95 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.51.3] — 2026-10-08
+## [1.51.8] — 2026-10-09
+
+### Performance
+
+- **`crdt`: resolve large within-update dependency queues in producer-first order.**
+  An immutable range index and iterative scheduler avoid repeated reverse-chain
+  retries. Contiguous client tails are processed before dependents, preventing
+  deferred tails from scanning a growing set of descendants. Small and entirely
+  blocked queues avoid indexing; unresolved or overlapping ranges retain the
+  fixed-point fallback and persistent pending limit.
+
+## [1.51.7] — 2026-10-09
+
+### Fixed
+
+- Resolve dependencies in complete V1/V2 checkpoints before applying the
+  cross-update pending limit. Preflight retains one blocked head and a decoder
+  cursor per wire group, preventing large per-struct metadata allocations on
+  incomplete updates. Unique-client groups with unfillable clock gaps or
+  dependencies outside both the update and store are counted without cursors.
+  V2 cursors share immutable column data; single-group updates reject oversized
+  blocked tails early. Rejected preflight updates add no deferred items to the
+  persistent pending queue, retain previously queued items, and do not roll back changes already integrated. The pending
+  limit, wire format and public API are unchanged.
+
+## [1.51.5] — 2026-10-09
+
+### Performance
+
+- **`crdt`: garbage collection after a transaction no longer rescans each
+  client's history once per deleted range.** `gcTxnDeleteSet` started every
+  range lookup at the start of the client's structs, so many sparse deletions
+  rescanned the same prefix. It now binary-searches for the struct containing
+  the range start; results are unchanged. At 50,000 structs a GC pass over
+  sparse ranges drops from about 212 ms to 0.28 ms. Thanks to @kovaa-dev.
+
+## [1.51.4] — 2026-10-09
+
+### Fixed
+
+- **`crdt`: text inserts picked up formatting yjs clears (#285).** `ApplyDelta`
+  inserts, `InsertEmbed`, and `Insert` with attributes inherited the formatting
+  around the cursor. They now clear every attribute they don't name, as yjs
+  `insertText` does; cleared and restored markers follow yjs's order. `Insert`
+  with nil or empty attributes still inherits, as yjs `insert` does with the
+  argument omitted.
+
+- **`crdt`: formatting emptied by a remote delete was never cleaned up (#284).**
+  yjs deletes format markers left covering no text after a remote transaction;
+  ygo kept them, so later text inherited stale formatting. ygo now runs the same
+  cleanup, as a local transaction with a nil origin, and only on texts yjs would
+  clean (not on a root first accessed after its markers arrived).
+
+- **`crdt`: formatted inserts dropped the right origin yjs keeps (#287).**
+
+- **`crdt`: two identical documents could clean up the same update
+  differently.** Delete sets were applied in map order. They now apply, and
+  retry when parked, in yjs's order, and V1 writes delete-set clients
+  descending like yjs and V2.
 
 ### Changed
 
-- Resolve large within-update dependency queues in producer-first order,
-  avoiding repeated full-queue retries on reverse client chains. Queues that
-  resolve in one pass or make no progress do not allocate a dependency index.
-  The sorted index stores immutable ranges and uses temporary memory
-  proportional to the remaining queue. Unresolved and overlapping ranges
-  retain fixed-point retries and the existing persistent pending limit.
-  Public API, wire format and cross-update drain behavior are unchanged.
+- Applying a remote update to formatted text may be followed by a local,
+  nil-origin cleanup transaction with its own update and observer events. The
+  default `UndoManager` captures it, as yjs's default tracked origins do.
+- A remote update that adds formatting to a text now walks that whole text, as
+  yjs does (about 170µs per update on a 100k-character document). Plain text is
+  unaffected. A random-position `InsertEmbed` into heavily fragmented formatted
+  text costs a full walk too.
+- V1 encodings list delete-set clients in descending order. Decoders accept
+  either order.
+
+## [1.51.3] — 2026-10-08
+
+### Fixed
+
+- **`crdt`: applying an update no longer merges same-client items that were
+  inserted toward different right neighbours.** `ApplyUpdate`
+  merged adjacent, clock-contiguous items from one client without checking
+  that the right item was inserted directly after the left one and that both
+  had the same right origin, and `RunGC` merged tombstones the same way. The
+  merged item kept only the left item's right origin. A peer that received
+  the items in one apply (a late joiner, an offline client catching up, a
+  server loading a stored state) then placed the next concurrent insert inside
+  that run differently from the peers that received the items one by one, and
+  every later encoding of its state (a sync step 2, a compacted state) gave
+  the right item's characters the wrong right origin, for ygo and Yjs alike.
+  Items now merge only under Yjs's `Item.mergeWith` conditions. States that
+  were already encoded with the merged items keep the wrong right origins.
 
 ## [1.51.2] — 2026-10-08
 

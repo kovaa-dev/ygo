@@ -312,96 +312,107 @@ cross-impl performance numbers: "faster than yrs" and "as conformant as
 yrs" are separate claims, and on the conformance axis ygo already has
 better-documented parity with the Yjs reference than yrs does.
 
-## Within-update dependency resolver
+## Pending-budget preflight review
 
-This comparison targets the resolver-only branch against main `07bd8f62`,
-without #260's pending-budget preflight or decoder refactor. V1 and V2 share the
-same resolver. Large queues first try one ordinary pass; all-ready and
-no-progress queues avoid the index. Remaining large queues use sorted immutable
-ranges, visit-state bytes and an explicit DFS stack, with no per-client map.
-There is at most one index build per call. On 64-bit systems its three flat
-arrays use about 41 bytes per indexed item, plus allocation rounding.
+These scenarios use `benchheavy`; sources are
+[`pending_budget_bench_test.go`](crdt/pending_budget_bench_test.go),
+[`pending_budget_review_bench_test.go`](crdt/pending_budget_review_bench_test.go) and
+[`pending_cursor_bench_test.go`](crdt/pending_cursor_bench_test.go).
 
-Unresolved and overlapping ranges retain fixed-point retries. The reverse-chain
-speedup is not a universal linear-time guarantee for whole Apply. Persistent
-pending limits, wire format, exported API and cross-update drains are unchanged.
-The separate checkpoint-budget fix is #260; both branches touch the resolver
-call sites and next-patch release entries, so merge ordering needs coordination.
-The combined implementation was also checked locally with a Go overlay over #260.
-
-Apple M4 Pro, macOS arm64, Go 1.26.8. Main and resolver use identical checked-in
-benchmark fixtures, built into frozen test binaries. Timing/B/op/allocs are
-medians of ten fresh-process samples, alternating old/new order. Complete chains
-and checkpoints use `-benchtime=1x`; ordinary Apply and keyed controls use
-`100ms`. Destination creation/destruction and result checks are outside the
-complete/keyed timers. All complete cases succeed with zero rejections; accepted
-missing queues retain exactly the expected pending item count.
-
-Peak RSS is the largest of three separate fresh native `/usr/bin/time -l`
-processes per variant. They load identical prepared wire files, run one GC,
-create one destination and apply the update. Runtime/input/document are included;
-fixture generation and build are excluded. RSS is peak footprint; MiB/op is
-cumulative allocation, not live heap. MiB = 1048576 bytes.
-
-Ordinary Apply timing changes are not statistically significant (n=10).
-The keyed V1 control remains about 9.7 s and 11.5 GiB allocated in both variants;
-a sampled allocation profile attributes about 99% of that volume to unchanged
-`Item.integrate`. Its maximum-of-three RSS rises from 25.609 to 27.406 MiB;
-this PR does not claim every memory metric improves in every workload. The keyed
-V2 control has unchanged B/op and allocation count. Missing keyed queues avoid
-building the search index and allocate about 12% fewer bytes than main.
-
-| Scenario | main ms/op | Resolver ms/op | main MiB/op | Resolver MiB/op | main allocs/op | Resolver allocs/op | main peak RSS MiB | Resolver peak RSS MiB |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| PendingReverseChain/V1/n=1000/cap=16 | 5.400728 | 0.540104 | 10.744484 | 0.575699 | 14,901.0 | 5,083.0 | 11.000 | 5.844 |
-| PendingReverseChain/V1/n=1000/cap=1001 | 5.135980 | 0.293000 | 10.744476 | 0.575699 | 14,900.5 | 5,083.0 | 10.625 | 5.766 |
-| PendingReverseChain/V1/n=20000/cap=16 | 2950.461125 | 7.332833 | 6487.447395 | 11.011459 | 448,931.0 | 100,413.0 | 21.203 | 15.938 |
-| PendingReverseChain/V1/n=20000/cap=20001 | 2920.717833 | 6.902020 | 6487.438744 | 11.011307 | 448,911.5 | 100,412.0 | 19.984 | 15.812 |
-| PendingReverseChain/V2/n=1000/cap=16 | 5.228668 | 0.306333 | 10.744949 | 0.581253 | 14,921.0 | 5,110.0 | 10.359 | 5.891 |
-| PendingReverseChain/V2/n=1000/cap=1001 | 5.246208 | 0.297709 | 10.745056 | 0.581253 | 14,922.0 | 5,110.0 | 10.656 | 5.594 |
-| PendingReverseChain/V2/n=20000/cap=16 | 2927.126126 | 7.233605 | 6487.547356 | 11.121353 | 448,935.5 | 100,439.0 | 19.750 | 16.031 |
-| PendingReverseChain/V2/n=20000/cap=20001 | 2949.614459 | 7.254978 | 6487.547188 | 11.121353 | 448,933.5 | 100,439.0 | 20.172 | 15.859 |
-| PendingManyClientCheckpoint/V2/n=10000/cap=16 | 718.029438 | 3.266666 | 1489.218369 | 5.424316 | 202,757.0 | 50,270.0 | 14.391 | 10.812 |
-| PendingManyClientCheckpoint/V2/n=10000/cap=10001 | 730.352249 | 3.208812 | 1489.218315 | 5.424316 | 202,756.5 | 50,270.0 | 14.578 | 10.844 |
-| PendingLinearClientQueue/V1/complete=true | 9713.925605 | 9658.783979 | 11780.117760 | 11781.429455 | 1,788,578.0 | 1,788,774.0 | 25.609 | 27.406 |
-| PendingLinearClientQueue/V1/complete=false | 2.818998 | 2.824740 | 5.989239 | 5.263546 | 139,805.0 | 139,784.0 | 11.844 | 11.172 |
-| PendingLinearClientQueue/V2/complete=true | 7.144987 | 7.386854 | 11.178537 | 11.178536 | 140,315.0 | 140,315.0 | 16.047 | 16.094 |
-| PendingLinearClientQueue/V2/complete=false | 2.730879 | 2.725317 | 6.080853 | 5.355153 | 119,844.0 | 119,823.0 | 11.641 | 11.062 |
-| ApplyUpdateV1 | 0.115113 | 0.115133 | 0.217911 | 0.217912 | 3,087.0 | 3,087.0 | 5.250 | 5.219 |
-| ApplyUpdateV1_Bulk | 0.001819 | 0.001819 | 0.003561 | 0.003561 | 37.0 | 37.0 | 5.078 | 5.000 |
-| ApplyUpdateV2 | 0.117203 | 0.115690 | 0.220558 | 0.220555 | 3,114.0 | 3,114.0 | 5.391 | 5.250 |
-| ApplyUpdateV2_Bulk | 0.002772 | 0.002772 | 0.005212 | 0.005212 | 62.0 | 62.0 | 5.266 | 4.859 |
-
-Run the comparison from the PR checkout, preserving the new benchmark fixtures
-on both sides. The overlay restores both production decoding source files to
-exact main; the new helper has no init or runtime caller in the baseline.
-Baseline regression tests are intentionally not run (`-run '^$'`).
+- Reverse chains exercise V1/V2 references to later client groups.
+- Many-client checkpoints use ordinary Ygo text transactions and V2 encoding.
+- Incomplete updates cover same-parent tails and varied missing clocks,
+  content lengths, cycles and client groups, including missing-client cursor bombs.
 
 ```sh
-bench_dir=$(mktemp -d)
-git show 07bd8f62:crdt/update.go > "$bench_dir/main-update.go"
-git show 07bd8f62:crdt/update_v2.go > "$bench_dir/main-update-v2.go"
-python3 - "$bench_dir" <<'PYOVERLAY'
-import json, pathlib, sys
-root = pathlib.Path.cwd()
-data = pathlib.Path(sys.argv[1])
-(data / 'main-overlay.json').write_text(json.dumps({'Replace': {
-    str(root / 'crdt/update.go'): str(data / 'main-update.go'),
-    str(root / 'crdt/update_v2.go'): str(data / 'main-update-v2.go'),
-}}))
-PYOVERLAY
-GOTOOLCHAIN=go1.26.8 go test -overlay="$bench_dir/main-overlay.json" -tags=benchheavy -c ./crdt -o "$bench_dir/main.test"
-GOTOOLCHAIN=go1.26.8 go test -tags=benchheavy -c ./crdt -o "$bench_dir/resolver.test"
-for variant in main resolver; do
-  "$bench_dir/$variant.test" -test.run '^$' -test.bench '^BenchmarkPending(ReverseChain|ManyClientCheckpoint)$' -test.benchmem -test.benchtime=1x -test.count=10 > "$bench_dir/$variant-complete.txt"
-  "$bench_dir/$variant.test" -test.run '^$' -test.bench '^Benchmark(ApplyUpdateV[12](_Bulk)?|PendingLinearClientQueue)$' -test.benchmem -test.benchtime=100ms -test.count=10 > "$bench_dir/$variant-controls.txt"
-done
-benchstat "$bench_dir/main-complete.txt" "$bench_dir/resolver-complete.txt"
-benchstat "$bench_dir/main-controls.txt" "$bench_dir/resolver-controls.txt"
+go test -tags benchheavy ./crdt -run '^$' \
+  -bench '^BenchmarkPending(ReverseChain|ManyClientCheckpoint|UpdateDiverseDependencies|CursorBomb)$' \
+  -benchmem -benchtime=1x -count=10 -timeout=30m
+go test -tags benchheavy ./crdt -run '^$' \
+  -bench '^Benchmark(ApplyUpdateV[12](_Bulk)?|PendingUpdateIncomplete)$' \
+  -benchmem -benchtime=100ms -count=10
 ```
 
-The measured batches alternate variant order per sample; the compact shell
-recipe above runs one batch per side. Raw samples, native RSS logs, frozen
-binaries and full benchstat are saved locally under
-`/tmp/ygo-pr260-review/resolver-pr/`. The fixture generators and regression tests
-are checked into this PR; the temporary artifact path is not a CI dependency.
+Compare at least ten samples with `benchstat`, using identical fixtures and
+options on both revisions. Fixture generation is outside the timed loop.
+Complete-update benches also exclude destination creation/destruction and
+result checks; `rejections/op` distinguishes rejection from successful restore.
+
+`B/op` and `allocs/op` are cumulative Go allocation metrics, not peak RAM.
+Reported peak RSS uses the largest of three fresh `/usr/bin/time -l` processes
+applying identical prepared wire bytes, with a GC before destination creation.
+Runtime/input/document are included; fixture generation and build are excluded.
+
+## Within-update dependency resolver
+
+Fixtures in `crdt/pending_budget_review_bench_test.go` and
+`crdt/pending_resolver_bench_test.go` cover reverse client chains, ordinary V2
+checkpoints, non-mergeable string/embed pairs per client, missing/complete keyed
+queues, overlapping ranges requiring fixed-point fallback, and scheduler-off
+fixed-point controls against an independent reference.
+
+```sh
+go test -tags benchheavy ./crdt -run '^$' \
+  -bench '^BenchmarkPending(ReverseChain|ManyClientCheckpoint|MultiStructChain|OverlapFallback|FixedPointFallback|LinearClientQueue)$' \
+  -benchmem -benchtime=1x -count=10 -timeout=30m
+go test ./crdt -run '^$' -bench '^BenchmarkApplyUpdateV[12](_Bulk)?$' \
+  -benchmem -benchtime=100ms -count=10
+benchstat before.txt after.txt
+```
+
+Complete-update timers exclude destination creation/destruction and result checks.
+`rejections/op` distinguishes rejection from successful restore. Compare identical
+fixtures and options on both revisions. Allocation volume is cumulative, not peak RAM.
+
+Local results: Apple M4 Pro, macOS arm64, Go 1.26.8; ten samples per revision,
+identical fixtures. Main is `8e7e969`, the preflight baseline is `bd642e5`.
+Time/allocations are medians. Peak RSS is the maximum of three fresh processes
+with prepared wire bytes; fixture generation and compilation are excluded,
+runtime/input/document included. The two-struct fixture uses a string and an
+own-origin embed; main rejects it at cap=16, so its successful-restore baseline
+is the preflight implementation. All restores shown below succeed.
+
+### V1 reverse chain, 20k clients (cap=16)
+
+| Metric | Before (main) | After |
+|---|---:|---:|
+| Time, ms/op | 2,893.409 | 13.358 |
+| Allocated, MiB/op | 6,487.445 | 17.138 |
+| Allocations/op | 448,947.5 | 160,624.0 |
+| Peak RSS, MiB | 20.297 | 16.734 |
+
+### V2 reverse chain, 20k clients (cap=16)
+
+| Metric | Before (main) | After |
+|---|---:|---:|
+| Time, ms/op | 2,952.139 | 13.803 |
+| Allocated, MiB/op | 6,487.548 | 17.251 |
+| Allocations/op | 448,941.0 | 160,635.0 |
+| Peak RSS, MiB | 20.578 | 16.047 |
+
+### V2 checkpoint, 10k clients (cap=16)
+
+| Metric | Before (main) | After |
+|---|---:|---:|
+| Time, ms/op | 726.269 | 6.444 |
+| Allocated, MiB/op | 1,489.219 | 8.494 |
+| Allocations/op | 202,762.5 | 80,369.5 |
+| Peak RSS, MiB | 15.297 | 11.188 |
+
+### V1 two structs/client, 20k clients (cap=16)
+
+| Metric | Before (#260) | After |
+|---|---:|---:|
+| Time, ms/op | 6,017.359 | 27.249 |
+| Allocated, MiB/op | 25.473 | 27.364 |
+| Allocations/op | 360,631.0 | 360,634.0 |
+| Peak RSS, MiB | 22.438 | 23.578 |
+
+### V2 two structs/client, 20k clients (cap=16)
+
+| Metric | Before (#260) | After |
+|---|---:|---:|
+| Time, ms/op | 5,910.772 | 25.692 |
+| Allocated, MiB/op | 33.364 | 35.255 |
+| Allocations/op | 300,630.5 | 300,633.5 |
+| Peak RSS, MiB | 40.359 | 39.891 |

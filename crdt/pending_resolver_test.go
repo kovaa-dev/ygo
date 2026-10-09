@@ -157,7 +157,7 @@ func TestUnit_PendingResolver_PersistentLimit(t *testing.T) {
 	}
 }
 
-// referenceWithinUpdatePending is main 07bd8f62's fixed-point resolver. It is
+// referenceWithinUpdatePending is the fixed-point resolver, kept as a reference. It is
 // independent of the scheduler, immutable index and shared retry-pass helper.
 func referenceWithinUpdatePending(txn *Transaction, pending []*Item) error {
 	for len(pending) > 0 {
@@ -223,30 +223,7 @@ func referenceWithinUpdatePending(txn *Transaction, pending []*Item) error {
 	return nil
 }
 
-func pendingReverseChain(version, n int) []byte {
-	doc := New()
-	defer doc.Destroy()
-	text := doc.GetText("text")
-	groups := make(map[ClientID][]*Item, n)
-	for i := 1; i <= n; i++ {
-		client := ClientID(i)
-		var origin *ID
-		if version == 1 && i < n {
-			origin = &ID{Client: client + 1}
-		}
-		if version == 2 && i > 1 {
-			origin = &ID{Client: client - 1}
-		}
-		groups[client] = []*Item{{ID: ID{Client: client}, Parent: &text.abstractType, Origin: origin, Content: NewContentString("x")}}
-	}
-	if version == 2 {
-		return encodeStructStoreV2(groups, newDeleteSet(), nil, doc.store)
-	}
-	return encodeStructStoreV1(groups, newDeleteSet(), nil, doc.store)
-}
-
-// Resource growth protects both decoder entry points: keeping V2's old inline
-// retry loop would produce tens of MiB on this small reverse-chain checkpoint.
+// Bound cumulative allocation through both public update entry points.
 func TestUnit_PendingResolver_BoundsReverseChainBytes(t *testing.T) {
 	for _, version := range []int{1, 2} {
 		t.Run(fmt.Sprint(version), func(t *testing.T) {
@@ -267,5 +244,101 @@ func TestUnit_PendingResolver_BoundsReverseChainBytes(t *testing.T) {
 			require.LessOrEqual(t, after.TotalAlloc-before.TotalAlloc, uint64(16*1024*1024), "reverse-chain allocated bytes")
 			doc.Destroy()
 		})
+	}
+}
+
+// Each client has a string and an own-origin embed, preserving two wire structs.
+func resolverMultiStructUpdate(version, n int) []byte {
+	source := New()
+	defer source.Destroy()
+	text := source.GetText("text")
+	groups := make(map[ClientID][]*Item, n)
+	for i := 1; i <= n; i++ {
+		c := ClientID(i)
+		var origin *ID
+		if version == 1 && i < n {
+			origin = &ID{Client: c + 1}
+		}
+		if version == 2 && i > 1 {
+			origin = &ID{Client: c - 1}
+		}
+		groups[c] = []*Item{
+			{ID: ID{Client: c}, Parent: &text.abstractType, Origin: origin, Content: NewContentString("x")},
+			{ID: ID{Client: c, Clock: 1}, Parent: &text.abstractType, Origin: &ID{Client: c}, Content: NewContentEmbed("e")},
+		}
+	}
+	if version == 2 {
+		return encodeStructStoreV2(groups, newDeleteSet(), nil, source.store)
+	}
+	return encodeStructStoreV1(groups, newDeleteSet(), nil, source.store)
+}
+
+func TestUnit_PendingResolver_MultiStructCheckpoint(t *testing.T) {
+	for _, version := range []int{1, 2} {
+		t.Run(fmt.Sprint(version), func(t *testing.T) {
+			const n = 2000
+			data := resolverMultiStructUpdate(version, n)
+			runtime.GC()
+			var before, after runtime.MemStats
+			runtime.ReadMemStats(&before)
+			doc := New(WithMaxPendingItems(16))
+			defer doc.Destroy()
+			apply := ApplyUpdateV1
+			if version == 2 {
+				apply = ApplyUpdateV2
+			}
+			err := apply(doc, data, nil)
+			runtime.ReadMemStats(&after)
+			require.NoError(t, err)
+			require.Equal(t, 2*n, doc.GetText("text").Len())
+			require.Len(t, doc.StateVector(), n)
+			require.Zero(t, doc.PendingStats().Items)
+			for _, clock := range doc.StateVector() {
+				require.Equal(t, uint64(2), clock)
+			}
+			require.LessOrEqual(t, after.TotalAlloc-before.TotalAlloc, uint64(n*4096), "ready tails must not create quadratic insertion allocations")
+		})
+	}
+}
+
+// Eager client tails must preserve content, clocks, pending items and events
+// when producers are split by origins inside multi-character strings.
+func TestUnit_PendingResolver_ContiguousTailsMatchReference(t *testing.T) {
+	const n = 64
+	for _, shape := range []string{"left", "right", "tree"} {
+		for seed := int64(0); seed < 8; seed++ {
+			t.Run(fmt.Sprintf("%s/%d", shape, seed), func(t *testing.T) {
+				docs := []*Doc{New(WithClientID(100001)), New(WithClientID(100001))}
+				var events [2][]string
+				for which, doc := range docs {
+					text := doc.GetText("text")
+					text.Observe(func(event YTextEvent) { events[which] = append(events[which], fmt.Sprintf("%#v", event.Delta)) })
+					pending := resolverTestItems(doc, n, shape)
+					for _, head := range append([]*Item(nil), pending...) {
+						length := uint64(head.Content.Len())
+						pending = append(pending, &Item{ID: ID{Client: head.ID.Client, Clock: length}, Origin: &ID{Client: head.ID.Client, Clock: length - 1}, Content: NewContentEmbed(int(head.ID.Client))})
+					}
+					rand.New(rand.NewSource(seed)).Shuffle(len(pending), func(i, j int) { pending[i], pending[j] = pending[j], pending[i] })
+					var err error
+					doc.Transact(func(txn *Transaction) {
+						if which == 0 {
+							err = referenceWithinUpdatePending(txn, pending)
+						} else {
+							err = resolveWithinUpdatePending(txn, pending)
+						}
+					})
+					require.NoError(t, err)
+				}
+				require.Equal(t, docs[0].StateVector(), docs[1].StateVector())
+				require.Equal(t, docs[0].PendingStats(), docs[1].PendingStats())
+				require.Equal(t, docs[0].GetText("text").ToString(), docs[1].GetText("text").ToString())
+				require.Equal(t, events[0], events[1])
+				require.Equal(t, EncodeStateAsUpdateV1(docs[0], nil), EncodeStateAsUpdateV1(docs[1], nil))
+				require.Equal(t, EncodeStateAsUpdateV2(docs[0], nil), EncodeStateAsUpdateV2(docs[1], nil))
+				for _, doc := range docs {
+					doc.Destroy()
+				}
+			})
+		}
 	}
 }
