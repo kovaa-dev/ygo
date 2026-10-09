@@ -1,4 +1,4 @@
-## v1.51.6
+## v1.51.7
 
 Complete V1/V2 checkpoints resolve dependencies within the update before the
 cross-update pending limit is applied. Preflight retains the current blocked
