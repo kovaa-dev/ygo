@@ -215,6 +215,9 @@ func (item *Item) integrate(txn *Transaction, offset int) {
 		item.Parent.length += item.Content.Len()
 		if item.Right != nil {
 			if hint > 0 {
+				if l := item.Left; l != nil && (l.Deleted || !l.Content.IsCountable()) {
+					item.Parent.dropUncountedMarkersAt(hint)
+				}
 				item.Parent.updateMarkerChanges(hint, item.Content.Len())
 			} else {
 				item.Parent.clearMarkers()
@@ -301,6 +304,8 @@ func (item *Item) integrate(txn *Transaction, offset int) {
 	// so their deletes skip the walk entirely (#86 final fix).
 	if _, ok := item.Content.(*ContentFormat); ok && item.Parent != nil {
 		item.Parent.hasFormatting = true
+		item.Parent.fmtGen++
+		item.Parent.cleanFormatting = true
 	}
 
 	// If this item wraps a nested type, set the back-pointer so the type
@@ -404,6 +409,9 @@ func (item *Item) delete(txn *Transaction) {
 		return
 	}
 	item.Deleted = true
+	if _, ok := item.Content.(*ContentFormat); ok && item.Parent != nil {
+		item.Parent.fmtGen++
+	}
 	if item.Parent != nil && item.Content.IsCountable() {
 		item.Parent.length -= item.Content.Len()
 		if !txn.Local {
