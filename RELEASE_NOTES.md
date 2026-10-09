@@ -1,3 +1,17 @@
+## v1.51.5
+
+**Who is affected:** documents with long editing histories where a transaction
+deletes many separate ranges, for example clearing scattered text or many
+array items at once.
+
+**Faster cleanup after deletes.** After each transaction ygo garbage-collects
+the content it deleted. For every deleted range it used to scan the client's
+history from the beginning; it now jumps straight to the right place. A pass
+over 50,000 structs with sparse deletions went from about 212 ms to under a
+millisecond. Nothing else changes. Thanks to @kovaa-dev for the fix.
+
+**Upgrading.** No API change.
+
 ## v1.51.4
 
 **Who is affected:** anyone using rich text (`YText` with formatting), embeds,

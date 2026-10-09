@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.51.5] — 2026-10-09
+
+### Performance
+
+- **`crdt`: garbage collection after a transaction no longer rescans each
+  client's history once per deleted range.** `gcTxnDeleteSet` started every
+  range lookup at the start of the client's structs, so many sparse deletions
+  rescanned the same prefix. It now binary-searches for the struct containing
+  the range start; results are unchanged. At 50,000 structs a GC pass over
+  sparse ranges drops from about 212 ms to 0.28 ms. Thanks to @kovaa-dev.
+
 ## [1.51.4] — 2026-10-09
 
 ### Fixed
