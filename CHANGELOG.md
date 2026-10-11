@@ -5,19 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.51.7] — 2026-10-09
+## [1.51.7] — 2026-10-11
 
 ### Fixed
 
-- Resolve dependencies in complete V1/V2 checkpoints before applying the
-  cross-update pending limit. Preflight retains one blocked head and a decoder
-  cursor per wire group, preventing large per-struct metadata allocations on
-  incomplete updates. Unique-client groups with unfillable clock gaps or
-  dependencies outside both the update and store are counted without cursors.
-  V2 cursors share immutable column data; single-group updates reject oversized
-  blocked tails early. Rejected preflight updates add no deferred items to the
-  persistent pending queue, retain previously queued items, and do not roll back changes already integrated. The pending
-  limit, wire format and public API are unchanged.
+- **`crdt`: a complete checkpoint could be rejected by the pending limit.**
+  When a V1/V2 update's structs depended on other structs later in the same
+  update, they were parked as pending and counted against the cross-update
+  pending limit, so a large but complete document state (for example a
+  many-client checkpoint) failed to apply. Dependencies inside the update are
+  now resolved first, and only structs still missing after that count against
+  the limit. A rejected update adds nothing to the persistent pending queue,
+  but changes integrated before the rejection are not rolled back. Preflight
+  keeps one cursor per wire group rather than metadata for every blocked
+  struct, so incomplete updates stay cheap to reject. The pending limit, wire
+  format and public API are unchanged. Thanks to @kovaa-dev.
+
+## [1.51.6] — 2026-10-11
+
+### Performance
+
+- **`crdt`: replacing a map value no longer scans unrelated keys.** Direct
+  replacements after the previous rightmost value skip the shared-list scan.
+  Concurrent and non-adjacent replacements retain conflict resolution.
 
 ## [1.51.5] — 2026-10-09
 
