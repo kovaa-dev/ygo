@@ -387,6 +387,12 @@ func (item *Item) integrate(txn *Transaction, offset int) {
 			if existing, ok := item.Parent.itemMap[key]; ok && existing != item && !existing.Deleted {
 				existing.delete(txn)
 			}
+			if item.Parent.itemMap == nil {
+				if !txn.allocate(128) {
+					return
+				}
+				item.Parent.itemMap = make(map[string]*Item)
+			}
 			item.Parent.itemMap[key] = item
 		}
 	}

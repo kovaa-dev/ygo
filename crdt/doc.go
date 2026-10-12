@@ -319,7 +319,6 @@ func (d *Doc) getOrCreateType(name string) *abstractType {
 	}
 	r := &rawType{}
 	r.doc = d
-	r.itemMap = make(map[string]*Item)
 	r.owner = r
 	r.name = name
 	d.share[name] = r
@@ -362,7 +361,6 @@ func (d *Doc) getArrayLocked(name string) *YArray {
 	}
 	arr := &YArray{}
 	arr.doc = d
-	arr.itemMap = make(map[string]*Item)
 	arr.owner = arr
 	arr.name = name
 	d.share[name] = arr
@@ -394,7 +392,6 @@ func (d *Doc) getMapLocked(name string) *YMap {
 	}
 	m := &YMap{}
 	m.doc = d
-	m.itemMap = make(map[string]*Item)
 	m.owner = m
 	m.name = name
 	d.share[name] = m
@@ -426,7 +423,6 @@ func (d *Doc) getTextLocked(name string) *YText {
 	}
 	txt := &YText{}
 	txt.doc = d
-	txt.itemMap = make(map[string]*Item)
 	txt.owner = txt
 	txt.name = name
 	d.share[name] = txt
@@ -863,7 +859,6 @@ func (d *Doc) getXmlFragmentLocked(name string) *YXmlFragment {
 	}
 	f := &YXmlFragment{}
 	f.doc = d
-	f.itemMap = make(map[string]*Item)
 	f.owner = f
 	f.name = name
 	d.share[name] = f

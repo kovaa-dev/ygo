@@ -376,24 +376,58 @@ func tryMergeWithLefts(txn *Transaction) {
 		return
 	}
 	store := txn.doc.store
+	if !txn.allocate(128) {
+		return
+	}
+	removed := make(map[ClientID]map[*Item]bool)
+	// Compact once per affected client, including on a later budget refusal.
+	// The scans are charged before that client's first merge.
+	defer func() {
+		for client, dead := range removed {
+			items := store.clients[client]
+			n := 0
+			for _, item := range items {
+				if !dead[item] {
+					items[n] = item
+					n++
+				}
+			}
+			clear(items[n:])
+			store.clients[client] = items[:n]
+		}
+	}()
 	for _, item := range txn.mergeStructs {
-		if !txn.work(uint64(len(store.clients[item.ID.Client])) + 1) {
+		if !txn.work(1) {
+			return
+		}
+		if !canMergeWithLeft(item) {
+			continue
+		}
+		if removed[item.ID.Client] == nil {
+			if !txn.work(uint64(len(store.clients[item.ID.Client])) + 1) {
+				return
+			}
+			if !txn.allocate(256) {
+				return
+			}
+			removed[item.ID.Client] = make(map[*Item]bool)
+		}
+		if !txn.allocate(64) {
 			return
 		}
 		if txn.budget != nil {
-			if !prepareBudgetSplit(txn, item) {
-				return
-			}
-			if item.Left != nil && !prepareBudgetSplit(txn, item.Left) {
+			if !prepareBudgetSplit(txn, item) || !prepareBudgetSplit(txn, item.Left) {
 				return
 			}
 		}
-		tryMergeWithLeft(item, store)
+		if mergeWithLeft(item) {
+			removed[item.ID.Client][item] = true
+		}
 	}
 }
 
-// tryMergeWithLeft attempts to absorb item into item.Left. Returns true when
-// the merge succeeded. Conditions, all required:
+// canMergeWithLeft checks whether item can be absorbed into item.Left.
+// Conditions, all required:
 //   - both items share the same client, parent, ParentSub, MovedBy, and Deleted state
 //   - left.Right == item (still directly adjacent in the linked list)
 //   - clocks are contiguous: left.ID.Clock + left.Content.Len() == item.ID.Clock
@@ -401,9 +435,8 @@ func tryMergeWithLefts(txn *Transaction) {
 //   - content types match and support merging (ContentString, ContentAny,
 //     ContentJSON, ContentDeleted)
 //
-// On success: left's content is extended in place, the linked list is spliced
-// past item, and item is removed from the store.
-func tryMergeWithLeft(item *Item, store *StructStore) bool {
+// This predicate neither mutates content nor scans the struct store.
+func canMergeWithLeft(item *Item) bool {
 	left := item.Left
 	if left == nil {
 		return false
@@ -444,6 +477,29 @@ func tryMergeWithLeft(item *Item, store *StructStore) bool {
 		return false
 	}
 
+	switch left.Content.(type) {
+	case *ContentString:
+		_, ok := item.Content.(*ContentString)
+		return ok
+	case *ContentAny:
+		_, ok := item.Content.(*ContentAny)
+		return ok
+	case *ContentJSON:
+		_, ok := item.Content.(*ContentJSON)
+		return ok
+	case *ContentDeleted:
+		_, ok := item.Content.(*ContentDeleted)
+		return ok
+	default:
+		return false
+	}
+}
+
+func mergeWithLeft(item *Item) bool {
+	if !canMergeWithLeft(item) {
+		return false
+	}
+	left := item.Left
 	// Content-type match + in-place extension.
 	switch lc := left.Content.(type) {
 	case *ContentString:
@@ -494,14 +550,6 @@ func tryMergeWithLeft(item *Item, store *StructStore) bool {
 		left.Parent.clearMarkers()
 	}
 
-	// Remove item from the store's per-client slice.
-	storeItems := store.clients[item.ID.Client]
-	for i, it := range storeItems {
-		if it == item {
-			store.clients[item.ID.Client] = append(storeItems[:i], storeItems[i+1:]...)
-			break
-		}
-	}
 	return true
 }
 

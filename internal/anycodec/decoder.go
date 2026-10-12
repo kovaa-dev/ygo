@@ -31,6 +31,8 @@ var (
 // Decoder reads values from a byte slice using the lib0 encoding format.
 // Decoder is not safe for concurrent use; each goroutine should use its own instance.
 type Decoder struct {
+	// Bounded, per-decoder reuse of immutable object-field names.
+	keys   map[string]string
 	buf    []byte
 	pos    int
 	budget *DecodeBudget
@@ -143,7 +145,8 @@ func (d *Decoder) ReadVarInt() (int64, error) {
 // mode. Without this, malformed input would silently produce a corrupt Go
 // string carrying non-UTF-8 bytes that downstream code may misinterpret.
 func (d *Decoder) ReadVarString() (string, error) {
-	b, err := d.ReadVarBytes()
+	// Converting to string below already owns the payload, even with CopyPayload.
+	b, err := d.readVarBytes(false)
 	if err != nil {
 		return "", err
 	}
@@ -404,6 +407,17 @@ func (d *Decoder) readAny(bigInt func(int64) any, depth int, skip bool) (any, er
 				k, err = d.ReadVarString()
 				if err != nil {
 					return nil, err
+				}
+				if canonical, ok := d.keys[k]; ok {
+					k = canonical
+				} else if len(k) <= 128 && len(d.keys) < 1024 {
+					if err := d.ReserveValues(1); err != nil {
+						return nil, err
+					}
+					if d.keys == nil {
+						d.keys = make(map[string]string)
+					}
+					d.keys[k] = k
 				}
 			}
 			v, err := d.readAny(bigInt, depth+1, skip)

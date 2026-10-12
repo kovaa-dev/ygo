@@ -45,7 +45,6 @@ package crdt
 func NewTextPrelim() *YText {
 	t := &YText{}
 	t.owner = t
-	t.itemMap = make(map[string]*Item)
 	return t
 }
 
@@ -53,7 +52,6 @@ func NewTextPrelim() *YText {
 func NewMapPrelim() *YMap {
 	m := &YMap{}
 	m.owner = m
-	m.itemMap = make(map[string]*Item)
 	return m
 }
 
@@ -61,7 +59,6 @@ func NewMapPrelim() *YMap {
 func NewArrayPrelim() *YArray {
 	a := &YArray{}
 	a.owner = a
-	a.itemMap = make(map[string]*Item)
 	return a
 }
 

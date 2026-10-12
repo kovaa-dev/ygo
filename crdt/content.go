@@ -288,9 +288,6 @@ func (t *abstractType) emptyCopy() *abstractType {
 		r.owner = r
 		at = &r.abstractType
 	}
-	if at.itemMap == nil {
-		at.itemMap = make(map[string]*Item)
-	}
 	return at
 }
 

@@ -1117,21 +1117,18 @@ func decodeTypeContentV2(dec *v2Decoder, doc *Doc, typeRef byte) (*abstractType,
 	case 0: // YArray
 		arr := &YArray{}
 		arr.doc = doc
-		arr.itemMap = make(map[string]*Item)
 		arr.owner = arr
 		return &arr.abstractType, nil
 
 	case 1: // YMap
 		m := &YMap{}
 		m.doc = doc
-		m.itemMap = make(map[string]*Item)
 		m.owner = m
 		return &m.abstractType, nil
 
 	case 2: // YText
 		txt := &YText{}
 		txt.doc = doc
-		txt.itemMap = make(map[string]*Item)
 		txt.owner = txt
 		return &txt.abstractType, nil
 
@@ -1147,7 +1144,6 @@ func decodeTypeContentV2(dec *v2Decoder, doc *Doc, typeRef byte) (*abstractType,
 	case 4: // YXmlFragment
 		frag := &YXmlFragment{}
 		frag.doc = doc
-		frag.itemMap = make(map[string]*Item)
 		frag.owner = frag
 		return &frag.abstractType, nil
 
@@ -1157,7 +1153,6 @@ func decodeTypeContentV2(dec *v2Decoder, doc *Doc, typeRef byte) (*abstractType,
 		}
 		r := &rawType{}
 		r.doc = doc
-		r.itemMap = make(map[string]*Item)
 		r.owner = r
 		return &r.abstractType, nil
 
@@ -1169,7 +1164,6 @@ func decodeTypeContentV2(dec *v2Decoder, doc *Doc, typeRef byte) (*abstractType,
 	default:
 		r := &rawType{}
 		r.doc = doc
-		r.itemMap = make(map[string]*Item)
 		r.owner = r
 		return &r.abstractType, nil
 	}

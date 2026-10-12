@@ -626,7 +626,6 @@ func (t *YXmlText) toXMLLocked() string {
 func NewYXmlElement(nodeName string) *YXmlElement {
 	checkUTF8("NewYXmlElement", "nodeName", nodeName)
 	e := &YXmlElement{NodeName: nodeName}
-	e.itemMap = make(map[string]*Item)
 	e.owner = e
 	return e
 }
@@ -635,7 +634,6 @@ func NewYXmlElement(nodeName string) *YXmlElement {
 // YXmlFragment or YXmlElement.
 func NewYXmlText() *YXmlText {
 	t := &YXmlText{}
-	t.itemMap = make(map[string]*Item)
 	t.owner = t
 	return t
 }
