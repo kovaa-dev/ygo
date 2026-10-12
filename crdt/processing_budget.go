@@ -22,6 +22,13 @@ var ErrBudgetObservers = errors.New("crdt: budgeted mutation requires an observe
 // reservation lifetime. AllocatedBytes is an upper charge usable until a resource
 // recount, not proof that all charged bytes remain reachable.
 type ProcessingBudget struct {
+	// ChangedKeys collects changed keys of named root maps, including nested edits.
+	// The caller owns the map and must discard it on transaction error. A positive
+	// limit and overflow destination are required when collection is enabled.
+	// Charges include key bytes and conservative bookkeeping, not an exact heap cap.
+	ChangedKeys         map[string]map[string]bool
+	ChangedKeysLimit    uint64
+	ChangedKeysOverflow *bool
 	// CompactObjects opts into read-only encoding.Object values for decoded Any objects.
 	CompactObjects                                         bool
 	Context                                                context.Context
@@ -119,6 +126,9 @@ func (doc *Doc) TransactWithBudget(fn func(*Transaction) error, budget *Processi
 	if !budget.step(0) {
 		return budget.err
 	}
+	if budget.ChangedKeys != nil && (budget.ChangedKeysLimit == 0 || budget.ChangedKeysOverflow == nil) {
+		return ErrInvalidUpdate
+	}
 	doc.mu.Lock()
 	defer doc.mu.Unlock()
 	doc.processingBudget = budget
@@ -176,6 +186,68 @@ func (doc *Doc) TransactWithBudget(fn func(*Transaction) error, budget *Processi
 				break
 			}
 			current = current.item.Parent
+		}
+	}
+	if budget.ChangedKeys != nil && !*budget.ChangedKeysOverflow {
+		var changedBytes uint64
+		for _, keys := range budget.ChangedKeys {
+			for key := range keys {
+				if !budget.step(1) {
+					return budget.err
+				}
+				changedBytes += uint64(len(key) + 128)
+			}
+		}
+		for typ, keys := range txn.changed {
+			root := typ
+			var nestedKey *string
+			for root.item != nil {
+				if !budget.step(1) {
+					return budget.err
+				}
+				nestedKey = root.item.ParentSub
+				root = root.item.Parent
+				if root == nil {
+					return ErrInvalidUpdate
+				}
+			}
+			add := func(key string) bool {
+				if !budget.step(1) {
+					return false
+				}
+				if *budget.ChangedKeysOverflow {
+					return true
+				}
+				if budget.ChangedKeys[root.name][key] {
+					return true
+				}
+				cost := uint64(len(key) + 128)
+				if changedBytes > budget.ChangedKeysLimit || cost > budget.ChangedKeysLimit-changedBytes {
+					*budget.ChangedKeysOverflow = true
+					clear(budget.ChangedKeys)
+					return true
+				}
+				changedBytes += cost
+				if !budget.allocate(uint64(len(key) + 128)) {
+					return false
+				}
+				if budget.ChangedKeys[root.name] == nil {
+					budget.ChangedKeys[root.name] = map[string]bool{}
+				}
+				budget.ChangedKeys[root.name][key] = true
+				return true
+			}
+			if typ == root {
+				for key := range keys {
+					if !add(key) {
+						return budget.err
+					}
+				}
+			} else if nestedKey != nil {
+				if !add(*nestedKey) {
+					return budget.err
+				}
+			}
 		}
 	}
 	if !budget.step(uint64(len(doc.store.clients))) || !budget.allocate(uint64(len(doc.store.clients))*128) {
