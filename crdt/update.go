@@ -184,12 +184,11 @@ func encodeV1Locked(doc *Doc, sv StateVector) []byte {
 	var groups []clientGroup
 	for client, items := range doc.store.clients {
 		svClock := sv.Clock(client)
-		var relevant []*Item
-		for _, item := range items {
-			if item.ID.Clock+uint64(item.Content.Len()) > svClock {
-				relevant = append(relevant, item)
-			}
-		}
+		// Client structs are ordered by clock; the requested update is a suffix.
+		index := sort.Search(len(items), func(i int) bool {
+			return items[i].ID.Clock+uint64(items[i].Content.Len()) > svClock
+		})
+		relevant := items[index:]
 		if len(relevant) > 0 {
 			groups = append(groups, clientGroup{client, relevant, svClock})
 		}
