@@ -2,6 +2,7 @@ package crdt
 
 import (
 	"bytes"
+	"github.com/reearth/ygo/encoding"
 	"sort"
 )
 
@@ -127,7 +128,50 @@ func (s *inspectionState) equalInspectionValue(a, b any) (bool, error) {
 			}
 		}
 		return true, nil
+	case *encoding.Object:
+		if other, ok := b.(*encoding.Object); ok {
+			if x.Len() != other.Len() {
+				return false, nil
+			}
+			for i := 0; i < x.Len(); i++ {
+				k, v := x.Field(i)
+				l, w := other.Field(i)
+				if err := s.dec.ReservePayload(uint64(len(k))); err != nil {
+					return false, err
+				}
+				if k != l {
+					return false, nil
+				}
+				same, err := s.equalInspectionValue(v, w)
+				if err != nil || !same {
+					return same, err
+				}
+			}
+			return true, nil
+		}
+		y, ok := b.(map[string]any)
+		if !ok || x.Len() != len(y) {
+			return false, nil
+		}
+		for i := 0; i < x.Len(); i++ {
+			k, v := x.Field(i)
+			if err := s.dec.ReservePayload(uint64(len(k))); err != nil {
+				return false, err
+			}
+			w, ok := y[k]
+			if !ok {
+				return false, nil
+			}
+			same, err := s.equalInspectionValue(v, w)
+			if err != nil || !same {
+				return same, err
+			}
+		}
+		return true, nil
 	case map[string]any:
+		if _, ok := b.(*encoding.Object); ok {
+			return s.equalInspectionValue(b, a)
+		}
 		y, ok := b.(map[string]any)
 		if !ok || len(x) != len(y) {
 			return false, nil

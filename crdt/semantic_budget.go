@@ -92,6 +92,17 @@ func admitSemanticValue(value any, meter *encoding.Encoder) error {
 				return meter.Err()
 			}
 			stack = append(stack, v...)
+		case *encoding.Object:
+			if !meter.ReserveAllocation(uint64(v.Len()) * 256) {
+				return meter.Err()
+			}
+			for i := 0; i < v.Len(); i++ {
+				key, item := v.Field(i)
+				if !meter.ReserveAllocation(uint64(len(key))*12 + 96) {
+					return meter.Err()
+				}
+				stack = append(stack, item)
+			}
 		case map[string]any:
 			if !meter.ReserveAllocation(uint64(len(v)) * 64) {
 				return meter.Err()

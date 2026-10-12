@@ -3,6 +3,7 @@ package crdt
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/reearth/ygo/encoding"
 	"strings"
 )
 
@@ -75,6 +76,15 @@ func ownLocalValue(v any, b *ProcessingBudget) any {
 		out := make([]any, len(x))
 		for i, v := range x {
 			out[i] = ownLocalValue(v, b)
+		}
+		return out
+	case *encoding.Object:
+		b.mustAllocate(uint64(x.Len())*256 + 1024)
+		out := make(map[string]any, x.Len())
+		for i := 0; i < x.Len(); i++ {
+			k, v := x.Field(i)
+			key := ownLocalValue(k, b).(string)
+			out[key] = ownLocalValue(v, b)
 		}
 		return out
 	case map[string]any:

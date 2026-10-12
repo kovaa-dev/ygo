@@ -1149,7 +1149,7 @@ func decodeContent(dec *encoding.Decoder, doc *Doc, tag byte) (Content, error) {
 		if err != nil {
 			return nil, err
 		}
-		optsAny, err := dec.ReadAny()
+		optsAny, err := dec.ReadAnyPlain()
 		if err != nil {
 			return nil, err
 		}
@@ -1394,7 +1394,7 @@ func readJSONVals(dec *encoding.Decoder, n uint64) ([]any, error) {
 func readLegacyAnyVals(dec *encoding.Decoder, n uint64) ([]any, error) {
 	vals := make([]any, n)
 	for i := range vals {
-		v, err := dec.ReadAny()
+		v, err := dec.ReadAnyPlain()
 		if err != nil {
 			return nil, err
 		}

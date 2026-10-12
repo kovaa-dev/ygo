@@ -35,6 +35,14 @@ func validateAnyValue(v any) error {
 			}
 		}
 		return nil
+	case *encoding.Object:
+		for i := 0; i < val.Len(); i++ {
+			_, v := val.Field(i)
+			if err := validateAnyValue(v); err != nil {
+				return err
+			}
+		}
+		return nil
 	case map[string]any:
 		for _, e := range val {
 			if err := validateAnyValue(e); err != nil {

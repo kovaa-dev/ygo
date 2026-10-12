@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"math"
+	"math/bits"
 	"unicode/utf8"
 )
 
@@ -33,6 +34,7 @@ var (
 type Decoder struct {
 	// Bounded, per-decoder reuse of immutable object-field names.
 	keys   map[string]string
+	shapes map[string][]string
 	buf    []byte
 	pos    int
 	budget *DecodeBudget
@@ -390,10 +392,15 @@ func (d *Decoder) readAny(bigInt func(int64) any, depth int, skip bool) (any, er
 			return nil, err
 		}
 		var out map[string]any
+		var compact *Object
 		if !skip {
-			out = make(map[string]any, n)
+			if d.budget != nil && d.budget.CompactObjects {
+				compact = &Object{keys: make([]string, n), values: make([]any, n)}
+			} else {
+				out = make(map[string]any, n)
+			}
 		}
-		for range n {
+		for i := range n {
 			var k string
 			if skip {
 				b, err := d.readVarBytes(false)
@@ -425,11 +432,34 @@ func (d *Decoder) readAny(bigInt func(int64) any, depth int, skip bool) (any, er
 				return nil, err
 			}
 			if !skip {
-				out[k] = v
+				if compact != nil {
+					compact.keys[i], compact.values[i] = k, v
+				} else {
+					out[k] = v
+				}
 			}
+		}
+		if compact != nil {
+			if d.budget.Work != nil {
+				if err := d.budget.Work(n * uint64(max(1, bits.Len64(n))) * uint64(max(1, bits.Len64(n)))); err != nil {
+					return nil, err
+				}
+			}
+			return d.finishObject(compact), nil
 		}
 		return out, nil
 	default:
 		return nil, ErrUnknownTag
 	}
+}
+
+// ReadAnyPlain is used for protocol metadata whose consumer requires maps.
+func (d *Decoder) ReadAnyPlain(bigInt func(int64) any) (any, error) {
+	if d.budget == nil {
+		return d.ReadAny(bigInt)
+	}
+	compact := d.budget.CompactObjects
+	d.budget.CompactObjects = false
+	defer func() { d.budget.CompactObjects = compact }()
+	return d.ReadAny(bigInt)
 }

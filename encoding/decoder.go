@@ -94,3 +94,11 @@ func (d *Decoder) ReadBigInt64() (int64, error) { return d.cursor.ReadBigInt64()
 func (d *Decoder) ReadAny() (any, error) {
 	return d.cursor.ReadAny(func(v int64) any { return BigInt(v) })
 }
+
+// Object is a read-only Any object returned by opt-in compact decoding.
+type Object = anycodec.Object
+
+// ReadAnyPlain decodes protocol metadata with ordinary mutable maps.
+func (d *Decoder) ReadAnyPlain() (any, error) {
+	return d.cursor.ReadAnyPlain(func(v int64) any { return BigInt(v) })
+}

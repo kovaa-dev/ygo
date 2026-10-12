@@ -21,7 +21,9 @@ type DecodeBudget struct {
 	payload         uint64
 	Reserve         func(uint64) error
 	CopyPayload     bool
-	err             error
+	// CompactObjects opts into read-only Object values instead of mutable maps.
+	CompactObjects bool
+	err            error
 }
 
 func (b *DecodeBudget) check() error {

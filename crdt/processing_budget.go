@@ -22,6 +22,8 @@ var ErrBudgetObservers = errors.New("crdt: budgeted mutation requires an observe
 // reservation lifetime. AllocatedBytes is an upper charge usable until a resource
 // recount, not proof that all charged bytes remain reachable.
 type ProcessingBudget struct {
+	// CompactObjects opts into read-only encoding.Object values for decoded Any objects.
+	CompactObjects                                         bool
 	Context                                                context.Context
 	MaxWork, MaxAllocatedBytes, MaxValues, MaxPayloadBytes uint64
 	Reserve                                                func(uint64) error
@@ -77,7 +79,7 @@ func (b *ProcessingBudget) allocate(n uint64) bool {
 func (t *Transaction) work(n uint64) bool     { return t.budget == nil || t.budget.step(n) }
 func (t *Transaction) allocate(n uint64) bool { return t.budget == nil || t.budget.allocate(n) }
 func (b *ProcessingBudget) decoder() *encoding.DecodeBudget {
-	return &encoding.DecodeBudget{Context: b.Context, MaxValues: b.MaxValues, MaxPayloadBytes: b.MaxPayloadBytes, CopyPayload: true, Work: func(n uint64) error {
+	return &encoding.DecodeBudget{Context: b.Context, MaxValues: b.MaxValues, MaxPayloadBytes: b.MaxPayloadBytes, CopyPayload: true, CompactObjects: b.CompactObjects, Work: func(n uint64) error {
 		if !b.step(n) {
 			return b.err
 		}

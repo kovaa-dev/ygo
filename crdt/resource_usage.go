@@ -1,5 +1,7 @@
 package crdt
 
+import "github.com/reearth/ygo/encoding"
+
 // ResourceUsage describes a conservative, version-specific resident charge for
 // server-owned documents loaded through ApplyUpdateV1WithBudget. It counts known
 // CRDT/container overhead and owned payloads, not process RSS or Go allocator
@@ -54,6 +56,17 @@ func (d *Doc) ResourceUsage(budget *ProcessingBudget) (ResourceUsage, error) {
 			}
 			for _, child := range x {
 				if !value(child) {
+					return false
+				}
+			}
+		case *encoding.Object:
+			if !budget.allocate(512) || !add(uint64(x.Len())*128+256) {
+				return false
+			}
+			for i := 0; i < x.Len(); i++ {
+				key, child := x.Field(i)
+				result.PayloadBytes += uint64(len(key))
+				if !add(uint64(len(key))) || !value(child) {
 					return false
 				}
 			}

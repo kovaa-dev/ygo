@@ -26,7 +26,7 @@ func checkUTF8(op, what, s string) {
 // checkAnyUTF8 walks v and panics on the first invalid string it finds.
 //
 // It mirrors the string-bearing cases of encoding.Encoder.WriteAny — string,
-// []any, and map[string]any (keys AND values). Every other case WriteAny
+// []any, encoding.Object, and map[string]any (keys AND values). Every other case WriteAny
 // handles (nil, bool, the integer and float types, BigInt, []byte) carries no
 // text. TestUnit_CheckAnyUTF8_CoversWriteAnyStringCases guards the pairing.
 //
@@ -39,6 +39,12 @@ func checkAnyUTF8(op, what string, v any) {
 	case []any:
 		for i, e := range t {
 			checkAnyUTF8(op, fmt.Sprintf("%s[%d]", what, i), e)
+		}
+	case *encoding.Object:
+		for i := 0; i < t.Len(); i++ {
+			k, e := t.Field(i)
+			checkUTF8(op, fmt.Sprintf("%s key %q", what, k), k)
+			checkAnyUTF8(op, fmt.Sprintf("%s[%q]", what, k), e)
 		}
 	case map[string]any:
 		for k, e := range t {

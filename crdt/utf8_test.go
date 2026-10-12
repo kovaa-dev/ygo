@@ -106,10 +106,10 @@ func TestUnit_CheckAnyUTF8_CoversWriteAnyStringCases(t *testing.T) {
 	require.Greater(t, end, -1)
 	cases := body[start : start+end]
 
-	// Only these three carry text. If a new one appears, extend checkAnyUTF8.
-	for _, want := range []string{"case string:", "case []any:", "case map[string]any:"} {
+	// These cases carry text. If a new one appears, extend checkAnyUTF8.
+	for _, want := range []string{"case string:", "case []any:", "case map[string]any:", "case *Object:"} {
 		require.Contains(t, cases, want)
 	}
-	require.Equal(t, 19, strings.Count(cases, "\tcase "),
+	require.Equal(t, 20, strings.Count(cases, "\tcase "),
 		"WriteAny's type switch changed — re-check whether the new case carries strings, then update this count")
 }

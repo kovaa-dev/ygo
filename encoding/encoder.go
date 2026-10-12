@@ -293,6 +293,17 @@ func (e *Encoder) WriteAny(v any) {
 			}
 			e.WriteAny(item)
 		}
+	case *Object:
+		e.WriteUint8(118)
+		e.WriteVarUint(uint64(val.Len()))
+		for i := 0; i < val.Len(); i++ {
+			if e.err != nil {
+				return
+			}
+			k, v := val.Field(i)
+			e.WriteVarString(k)
+			e.WriteAny(v)
+		}
 	case map[string]any:
 		e.WriteUint8(118)
 		e.WriteVarUint(uint64(len(val)))
