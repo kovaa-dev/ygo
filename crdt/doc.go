@@ -485,9 +485,9 @@ func buildPhase2(d *Doc, txn *Transaction) func() {
 				break
 			}
 			firedDeep[current] = struct{}{}
-			if len(current.deepObservers) > 0 {
-				fns := make([]func(*Transaction), len(current.deepObservers))
-				for i, s := range current.deepObservers {
+			if current.deep != nil && len(current.deep.entries) > 0 {
+				fns := make([]func(*Transaction), len(current.deep.entries))
+				for i, s := range current.deep.entries {
 					fns[i] = s.fn
 				}
 				deepSnap = append(deepSnap, deepEntry{fns})

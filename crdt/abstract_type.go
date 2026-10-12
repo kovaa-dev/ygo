@@ -32,9 +32,12 @@ type deepSub struct {
 	fn func(*Transaction)
 }
 
-// abstractType is the base embedded in every shared type (YArray, YMap, YText).
-// It owns the doubly-linked list of Items that backs the type's content and
-// provides the bookkeeping that Item integration needs.
+type deepSubscriptions struct {
+	nextID  uint64
+	entries []deepSub
+}
+
+// abstractType owns the shared type list and integration bookkeeping.
 type abstractType struct {
 	doc     *Doc
 	start   *Item
@@ -56,10 +59,8 @@ type abstractType struct {
 	// released this way is legitimately re-stageable — this is deliberately an
 	// owner pointer, not a sticky bit.
 	stagedOn *abstractType
-	// deepSubIDGen issues unique IDs for ObserveDeep subscriptions so that
-	// out-of-order unsubscription removes the correct entry (C5).
-	deepSubIDGen  uint64
-	deepObservers []deepSub
+	// Deep subscriptions are absent on most nested and server-owned types.
+	deep *deepSubscriptions
 
 	// insertHint is set by Insert callers to the logical index of an imminent
 	// local insertion. When non-zero, item.integrate uses partial marker
@@ -77,14 +78,6 @@ type abstractType struct {
 	// always safe — once we walk past a deleted item we never need to revisit.
 	firstLiveCache *Item
 
-	// hasFormatting becomes true the first time a ContentFormat item is
-	// integrated into this type (locally via YText.Format or remotely via
-	// an update). Mirrors Yjs's _hasFormatting flag. YText.Delete uses this
-	// to skip the (expensive) per-deleted-item cleanup walk on types that
-	// have never had formatting applied — the dominant cost on head-delete
-	// workloads in plain-text documents. Once true, stays true.
-	hasFormatting bool
-
 	// markers is a small cache of (rendered index → *Item) search markers,
 	// modelled on Yjs's ArraySearchMarker, replacing the old posCache. Capped
 	// at maxSearchMarker entries. The write path (findMarkerMut, called from
@@ -97,6 +90,14 @@ type abstractType struct {
 	// which marker to evict/refresh (LRU-by-recency) in markPosition/
 	// markPositionAt.
 	markerTimestamp uint64
+	// hasFormatting becomes true the first time a ContentFormat item is
+	// integrated into this type (locally via YText.Format or remotely via
+	// an update). Mirrors Yjs's _hasFormatting flag. YText.Delete uses this
+	// to skip the (expensive) per-deleted-item cleanup walk on types that
+	// have never had formatting applied — the dominant cost on head-delete
+	// workloads in plain-text documents. Once true, stays true.
+	hasFormatting bool
+
 	// disableMarkers is a test-only seam that forces findMarkerRO (and, once
 	// later tasks add a marker-aware write path, the rest of the
 	// marker-based lookups) to fall back to a full linear walk from t.start,
@@ -236,17 +237,20 @@ func (t *abstractType) observeDeep(fn func(*Transaction)) func() {
 		doc.mu.Lock()
 		defer doc.mu.Unlock()
 	}
-	t.deepSubIDGen++
-	id := t.deepSubIDGen
-	t.deepObservers = append(t.deepObservers, deepSub{id: id, fn: fn})
+	if t.deep == nil {
+		t.deep = &deepSubscriptions{}
+	}
+	t.deep.nextID++
+	id := t.deep.nextID
+	t.deep.entries = append(t.deep.entries, deepSub{id: id, fn: fn})
 	return func() {
 		if doc := t.doc; doc != nil {
 			doc.mu.Lock()
 			defer doc.mu.Unlock()
 		}
-		for i, s := range t.deepObservers {
+		for i, s := range t.deep.entries {
 			if s.id == id {
-				t.deepObservers = append(t.deepObservers[:i], t.deepObservers[i+1:]...)
+				t.deep.entries = append(t.deep.entries[:i], t.deep.entries[i+1:]...)
 				return
 			}
 		}

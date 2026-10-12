@@ -209,7 +209,7 @@ func (doc *Doc) TransactWithBudget(fn func(*Transaction) error, budget *Processi
 	return nil
 }
 func hasBudgetObservers(t *abstractType) bool {
-	if len(t.deepObservers) > 0 {
+	if t.deep != nil && len(t.deep.entries) > 0 {
 		return true
 	}
 	switch v := t.owner.(type) {
