@@ -96,3 +96,54 @@ func TestCompat_MapReplacementInsideDeletedRun(t *testing.T) {
 		})
 	}
 }
+
+// XML children and attributes have separate conflict orders even though they
+// share a linked list. Concurrent children retain client order in every delivery.
+func TestUnit_Item_XmlChildrenIgnoreConcurrentAttribute(t *testing.T) {
+	for _, version := range []int{1, 2} {
+		t.Run(fmt.Sprintf("v%d", version), func(t *testing.T) {
+			encode, apply := EncodeStateAsUpdateV1, ApplyUpdateV1
+			if version == 2 {
+				encode, apply = EncodeStateAsUpdateV2, ApplyUpdateV2
+			}
+			base := New(WithClientID(100))
+			defer base.Destroy()
+			fragment := base.GetXmlFragment("x")
+			base.Transact(func(txn *Transaction) {
+				fragment.InsertElement(txn, 0, NewYXmlElement("e"))
+			})
+			initial := encode(base, nil)
+			makeUpdate := func(client ClientID, edit func(*Transaction, *YXmlElement)) []byte {
+				doc := New(WithClientID(client))
+				defer doc.Destroy()
+				require.NoError(t, apply(doc, initial, nil))
+				sv := doc.StateVector()
+				element := doc.GetXmlFragment("x").Children()[0].(*YXmlElement)
+				doc.Transact(func(txn *Transaction) { edit(txn, element) })
+				return encode(doc, sv)
+			}
+			updates := map[byte][]byte{
+				'b': makeUpdate(2, func(txn *Transaction, el *YXmlElement) {
+					el.InsertElement(txn, 0, NewYXmlElement("b"))
+				}),
+				'a': makeUpdate(9, func(txn *Transaction, el *YXmlElement) {
+					el.SetAttribute(txn, "k", "v")
+				}),
+				'c': makeUpdate(3, func(txn *Transaction, el *YXmlElement) {
+					el.InsertElement(txn, 0, NewYXmlElement("c"))
+				}),
+			}
+			for _, order := range []string{"bac", "bca", "abc", "acb", "cab", "cba"} {
+				t.Run(order, func(t *testing.T) {
+					doc := New()
+					defer doc.Destroy()
+					require.NoError(t, apply(doc, initial, nil))
+					for i := range order {
+						require.NoError(t, apply(doc, updates[order[i]], nil))
+					}
+					require.Equal(t, `<e k="v"><b></b><c></c></e>`, doc.GetXmlFragment("x").ToXML())
+				})
+			}
+		})
+	}
+}
