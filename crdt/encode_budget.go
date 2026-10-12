@@ -15,9 +15,29 @@ func EncodeStateAsUpdateV1WithBudget(doc *Doc, sv StateVector, budget *encoding.
 	doc.mu.Lock()
 	defer doc.mu.Unlock()
 	enc := encoding.NewEncoderWithBudget(budget)
+	if err := encodeStateV1To(doc, sv, enc); err != nil {
+		return nil, err
+	}
+	return enc.Bytes(), nil
+}
+
+// CompareStateAsUpdateV1WithBudget compares the integrated state encoding with
+// expected bytes without allocating an output-sized buffer. It follows the same
+// integrated-state semantics as EncodeStateAsUpdateV1WithBudget.
+func CompareStateAsUpdateV1WithBudget(doc *Doc, sv StateVector, expected []byte, budget *encoding.EncodeBudget) error {
+	doc.mu.Lock()
+	defer doc.mu.Unlock()
+	enc := encoding.NewComparingEncoder(expected, budget)
+	if err := encodeStateV1To(doc, sv, enc); err != nil {
+		return err
+	}
+	return enc.FinishComparison()
+}
+
+func encodeStateV1To(doc *Doc, sv StateVector, enc *encoding.Encoder) error {
 	clients := budgetSortedClients(doc, enc)
 	if enc.Err() != nil {
-		return nil, enc.Err()
+		return enc.Err()
 	}
 	groups := 0
 	for _, client := range clients {
@@ -74,9 +94,9 @@ func EncodeStateAsUpdateV1WithBudget(doc *Doc, sv StateVector, budget *encoding.
 		countDeletedRanges(items, enc, func(clock, length uint64) { enc.WriteVarUint(clock); enc.WriteVarUint(length) })
 	}
 	if err := enc.Err(); err != nil {
-		return nil, err
+		return err
 	}
-	return enc.Bytes(), nil
+	return nil
 }
 
 // EncodeStateVectorV1WithBudget bounds state-vector allocation and encoding.

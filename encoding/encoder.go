@@ -18,9 +18,10 @@ var ErrVarIntOutOfRange = errors.New("encoding: VarInt magnitude exceeds lib0 55
 // Encoder writes values into a growing byte buffer using the lib0 encoding format.
 // Encoder is not safe for concurrent use; each goroutine should use its own instance.
 type Encoder struct {
-	buf    []byte
-	budget *EncodeBudget
-	err    error
+	comparison *comparison
+	buf        []byte
+	budget     *EncodeBudget
+	err        error
 }
 
 // NewEncoder returns a new Encoder with a small pre-allocated buffer.
@@ -36,6 +37,10 @@ func (e *Encoder) Reset() { e.buf = e.buf[:0] }
 
 // WriteRaw appends raw bytes to the encoder buffer without any length prefix.
 func (e *Encoder) WriteRaw(b []byte) {
+	if e.comparison != nil {
+		e.compareBytes(b)
+		return
+	}
 	if e.reserve(len(b)) {
 		e.buf = append(e.buf, b...)
 	}
@@ -129,7 +134,9 @@ func (e *Encoder) WriteVarStringE(s string) error {
 		return ErrInvalidUTF8
 	}
 	e.WriteVarUint(uint64(len(s)))
-	if e.reserve(len(s)) {
+	if e.comparison != nil {
+		e.compareString(s)
+	} else if e.reserve(len(s)) {
 		e.buf = append(e.buf, s...)
 	}
 	return nil
@@ -153,9 +160,7 @@ func (e *Encoder) WriteVarString(s string) {
 // WriteVarBytes encodes b as VarUint(len) followed by raw bytes.
 func (e *Encoder) WriteVarBytes(b []byte) {
 	e.WriteVarUint(uint64(len(b)))
-	if e.reserve(len(b)) {
-		e.buf = append(e.buf, b...)
-	}
+	e.WriteRaw(b)
 }
 
 // BigInt represents lib0 writeAny tag 122, encoded as a signed 64-bit integer.

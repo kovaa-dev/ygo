@@ -32,7 +32,7 @@ func GetEncoder() *Encoder {
 // PutEncoder returns e to the pool for reuse. Callers must not access e
 // or any slice obtained from e.Bytes() after this call returns.
 func PutEncoder(e *Encoder) {
-	if e == nil {
+	if e == nil || e.comparison != nil {
 		return
 	}
 	encoderPool.Put(e)

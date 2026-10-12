@@ -62,6 +62,9 @@ func (e *Encoder) reserveTemporary(n uint64) bool {
 }
 
 func (e *Encoder) reserve(n int) bool {
+	if e.comparison != nil {
+		return e.reserveComparison(n)
+	}
 	if e.budget == nil {
 		return true
 	}
